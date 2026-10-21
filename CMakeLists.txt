@@ -36,6 +36,28 @@ endif()
 
 include(${SDK}/cmake/XbeRecomp.cmake)
 
+include(FetchContent)
+FetchContent_Declare(vulkan_headers
+    GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+    GIT_TAG 217e93c664ec6704ec2d8c36fa116c1a4a1e2d40
+    GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(vulkan_headers)
+
+set(ENABLE_HLSL ON CACHE BOOL "" FORCE)
+set(ENABLE_OPT OFF CACHE BOOL "" FORCE)
+set(ENABLE_SPVREMAPPER OFF CACHE BOOL "" FORCE)
+set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
+set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
+set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(glslang
+    GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
+    GIT_TAG a57276bf558f5cf94d3a9854ebdf5a2236849a5a
+    GIT_SHALLOW FALSE
+)
+FetchContent_MakeAvailable(glslang)
+
 
 # the installer of the release (tools/installer)
 add_subdirectory(tools/installer)
@@ -56,5 +78,24 @@ endif()
 
 # target name = GAME_EXE in build.bat, xbe = GAME_XBE
 add_xbe_image(CODFH default.xbe game.toml ${GAME_PARTITIONS} game)
+target_sources(CODFH PRIVATE
+    sdk/runtime/gpu/vulkan/buffer.cpp
+    sdk/runtime/gpu/vulkan/commands.cpp
+    sdk/runtime/gpu/vulkan/image.cpp
+    sdk/runtime/gpu/vulkan/loader.cpp
+    sdk/runtime/gpu/vulkan/context.cpp
+    sdk/runtime/gpu/vulkan/copy.cpp
+    sdk/runtime/gpu/vulkan/descriptors.cpp
+    sdk/runtime/gpu/vulkan/pipeline.cpp
+    sdk/runtime/gpu/vulkan/pipeline_state.cpp
+    sdk/runtime/gpu/vulkan/shader.cpp
+    sdk/runtime/gpu/vulkan/win32_surface.cpp
+    sdk/runtime/gpu/vulkan/swapchain.cpp
+    sdk/runtime/gpu/vulkan/sampler.cpp
+    sdk/runtime/gpu/vulkan/shader_sources.cpp
+    sdk/runtime/gpu/vulkan/upload_allocator.cpp
+    sdk/runtime/gpu/vulkan/backend.cpp
+)
+target_link_libraries(CODFH PRIVATE Vulkan::Headers glslang glslang-default-resource-limits)
 target_sources(CODFH PRIVATE src/codfh.rc)
 set_source_files_properties(src/codfh.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/installer/art/app.ico)

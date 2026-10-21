@@ -118,6 +118,7 @@ struct FixedKey {
                            // diffuse, specular, ambient, emissive (material when the vertex lacks that colour)
     uint32_t types = 0;    // D3DLIGHTTYPE per light, 2 bits each, 0 off
     uint32_t tex[4] = {};  // per stage: coordinate set, texgen at bit 4, D3DTTFF count at bit 8, projected bit 11, set size at bit 12
+    bool operator==(const FixedKey&) const = default;
 };
 FixedKey MakeFixedKey(const State& s);
 // the same for lit fixed function vertices whose material colours are not the vertices'

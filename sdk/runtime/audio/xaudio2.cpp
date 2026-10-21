@@ -29,7 +29,7 @@ void SetTap(std::function<void(const float*, uint32_t)> tap) {
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
     std::thread([render] {
-        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         IXAudio2* xa = nullptr;
         IXAudio2MasteringVoice* master = nullptr;
         IXAudio2SourceVoice* voice = nullptr;
@@ -40,11 +40,20 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         wf.wBitsPerSample = 32;
         wf.nBlockAlign = 8;
         wf.nAvgBytesPerSec = kRate * 8;
-        if (FAILED(XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)) || FAILED(xa->CreateMasteringVoice(&master)) ||
-            FAILED(xa->CreateSourceVoice(&voice, &wf))) {
-            LOGE("audio: XAudio2 unavailable, no sound");
+        auto failed = [&](const char* operation, HRESULT hr) {
+            if (SUCCEEDED(hr)) return false;
+            LOGE("audio: %s failed (%08X), no sound", operation, unsigned(hr));
+            if (voice) voice->DestroyVoice();
+            if (master) master->DestroyVoice();
+            if (xa) xa->Release();
+            if (SUCCEEDED(com)) CoUninitialize();
+            return true;
+        };
+        if (failed("COM initialization", com) ||
+            failed("XAudio2Create", XAudio2Create(&xa, 0, XAUDIO2_DEFAULT_PROCESSOR)) ||
+            failed("CreateMasteringVoice", xa->CreateMasteringVoice(&master)) ||
+            failed("CreateSourceVoice", xa->CreateSourceVoice(&voice, &wf)))
             return;
-        }
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;
         std::vector<float> bufs(kSlots * kFrames * 2);

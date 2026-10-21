@@ -87,6 +87,12 @@ uint32_t g_depth = 0;
 uint32_t g_scratch_push = 0, g_scratch_size = 0;
 uint32_t g_walk = 0;  // first scratch command not read yet
 
+void CheckBackendFailure() {
+    if (!g_backend || !g_backend->Failed()) return;
+    LOGE("d3d: renderer reported a terminal failure; shutting down");
+    kernel::Shutdown(1);
+}
+
 uint32_t Dev(uint32_t off) { return R32(kDevice + off); }
 void SetDev(uint32_t off, uint32_t v) { W32(kDevice + off, v); }
 
@@ -287,8 +293,16 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         g_depth = NewSurface(w, h, zf, zf == 0x30 || zf == 0x31 ? 2 : 4);  // 0x30 LIN_D16, 0x31 LIN_F16
     }
     if (!g_backend) {
-        g_backend = gpu::CreateBackend();
-        if (!g_backend->Init(w, h)) LOGE("d3d: renderer init failed");
+        auto backend = gpu::CreateBackend();
+        if (!backend) {
+            LOGE("d3d: no renderer was selected; device creation is aborted");
+            kernel::Shutdown(1);
+        }
+        if (!backend->Init(w, h)) {
+            LOGE("d3d: renderer init failed; device creation is aborted");
+            kernel::Shutdown(1);
+        }
+        g_backend = std::move(backend);
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
     g_state = gpu::State{};
@@ -358,6 +372,7 @@ HLE_STDCALL(D3D_BlockOnResource, 1) {
         } else {
             g_backend->WaitResource(res);
         }
+        CheckBackendFailure();
     }
     gpu::MarkDirty(res);
     return 0;
@@ -369,12 +384,14 @@ HLE_WRAP(Lock2DSurface, 6) {
     if ((a[5] & 0x20) && res && g_backend) {  // D3DLOCK_NOOVERWRITE
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         g_backend->SyncLate(mem::VirtualFromPhysical(R32(res + 4)));
+        CheckBackendFailure();
     }
 }
 HLE_STDCALL(D3DResource_BlockUntilNotBusy, 1) {
     if (a[0] && g_backend) {
         std::lock_guard<std::recursive_mutex> lock(g_lock);
         g_backend->WaitResource(a[0]);
+        CheckBackendFailure();
     }
     gpu::MarkDirty(a[0]);
     return 0;
@@ -386,29 +403,37 @@ HLE_STDCALL(D3DResource_IsBusy, 1) {
     // set on the device, a surface also through its texture
     uint32_t common = R32(res), parent = (common & 0x70000) == 0x50000 ? R32(res + 0x14) : 0;
     if ((common & 0x780000) || (parent && (R32(parent) & 0x780000))) return 1;  // internal reference count
-    return g_backend && g_backend->Busy(res) ? 1 : 0;
+    const bool busy = g_backend && g_backend->Busy(res);
+    CheckBackendFailure();
+    return busy ? 1 : 0;
 }
 HLE_STDCALL(D3D_BlockOnTime, 2) { return 0; }
 HLE_STDCALL(D3DDevice_BlockOnFence, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend) g_backend->WaitFence(a[0]);
+    CheckBackendFailure();
     return 0;
 }
 HLE_STDCALL(D3DDevice_InsertFence, 0) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    CheckBackendFailure();
     return g_backend ? g_backend->Fence() : 0;
 }
 HLE_STDCALL(D3DDevice_IsFencePending, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    return g_backend && g_backend->FencePending(a[0]) ? 1 : 0;
+    const bool pending = g_backend && g_backend->FencePending(a[0]);
+    CheckBackendFailure();
+    return pending ? 1 : 0;
 }
 HLE_STDCALL(D3D_SetFence, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    CheckBackendFailure();
     return g_backend ? g_backend->Fence() : 0;
 }
 HLE_STDCALL(D3D_KickOffAndWaitForIdle, 0) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend) g_backend->Flush();
+    CheckBackendFailure();
     return 0;
 }
 HLE_FASTCALL(CDevice_KickOff, 0) { return 0; }
@@ -440,6 +465,7 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
     uint32_t pitch = ((size >> 24 & 0xFF) + 1) * 64, height = (size >> 12 & 0xFFF) + 1, bytes = pitch * height;
     uint32_t data = mem::VirtualFromPhysical(R32(front + 4));
     if (g_backend) g_backend->Sync(data, bytes);
+    CheckBackendFailure();
     kernel::SavePersistedDisplay(R32(front), R32(front + 0xC), size, HostPtr(data), bytes);
     LOGI("d3d: PersistDisplay, %u bytes", bytes);
     return 0;
@@ -450,6 +476,7 @@ HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
     uint8_t ramp[768];
     std::memcpy(ramp, HostPtr(a[1]), 768);
     if (g_backend) g_backend->SetGamma(ramp);
+    CheckBackendFailure();
     return 0;
 }
 
@@ -508,6 +535,7 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         {
             std::lock_guard<std::recursive_mutex> lock(g_lock);
             if (g_backend) g_backend->Flush();
+            CheckBackendFailure();
         }
         app::FinishHandover();
     }
@@ -530,9 +558,11 @@ static uint32_t SwapNow() {
         if (Dev(XDK_CDevice_GammaPending + i * 4) == 1) {
             SetDev(XDK_CDevice_GammaPending + i * 4, 0);
             g_backend->SetGamma(static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300)));
+            CheckBackendFailure();
         }
     }
     if (g_backend) g_backend->Present(SurfaceOf(g_buffers[1]));
+    CheckBackendFailure();
     // like the XDK, the surfaces stay put and their memory rotates: titles keep back buffer pointers and copy its data
     uint32_t last = g_buffers[g_buffer_count - 1], data = R32(last + 4), lk = R32(last + 8);
     for (uint32_t i = g_buffer_count - 1; i > 0; i--) {
@@ -551,12 +581,14 @@ HLE_STDCALL(D3DDevice_Clear, 6) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     const uint8_t* rects = a[0] && a[1] ? static_cast<const uint8_t*>(HostPtr(a[1])) : nullptr;
     if (g_backend) g_backend->Clear(g_state, a[0], rects, a[2], a[3], ArgF(a, 4), a[5]);
+    CheckBackendFailure();
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_CopyRects, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (g_backend) g_backend->Copy(SurfaceOf(a[0]), SurfaceOf(a[3]), a[2], a[1], a[4]);
+    CheckBackendFailure();
     return 0;
 }
 
@@ -1095,6 +1127,7 @@ HLE_STDCALL(D3DDevice_DrawVertices, 3) {
     SyncDeferred();
     LogTexDrawStack(ctx);
     if (g_backend) g_backend->Draw(g_state, a[0], a[1], a[2], nullptr);
+    CheckBackendFailure();
     return 0;
 }
 
@@ -1105,6 +1138,7 @@ HLE_STDCALL(D3DDevice_DrawIndexedVertices, 3) {
     LogTexDrawStack(ctx);
     const uint8_t* indices = a[2] ? static_cast<const uint8_t*>(HostPtr(a[2])) : nullptr;
     if (g_backend) g_backend->Draw(g_state, a[0], 0, a[1], indices);
+    CheckBackendFailure();
     return 0;
 }
 
@@ -1129,6 +1163,7 @@ uint32_t UpVertices(const void* src, uint32_t bytes) {
     if (to != from) {
         g_up_fence[from] = g_backend->Fence();
         g_backend->WaitFence(g_up_fence[to]);
+        CheckBackendFailure();
     }
     std::memcpy(HostPtr(g_up_ring + pos), src, bytes);
     g_up_pos = pos + room;
@@ -1142,6 +1177,7 @@ void DrawUp(uint32_t prim, uint32_t count, const void* vertices, uint32_t stride
     auto stream = g_state.streams[0];
     g_state.streams[0] = {UpVertices(vertices, count * stride), stride};
     g_backend->Draw(g_state, prim, 0, count, nullptr);
+    CheckBackendFailure();
     g_state.streams[0] = stream;
 }
 
@@ -1179,21 +1215,9 @@ void EndPrimitive() {
     Made& m = made[{from.get(), g_im_mask}];
     if (!m.vs) {
         m.from = from;
-        m.vs = std::make_shared<gpu::VertexShader>();
-        if (from) {
-            m.vs->program = from->program;
-            m.vs->program_type = from->program_type;
-        }
-        for (uint32_t s = 0; s < 16; s++)
-            if (g_im_mask >> s & 1) {
-                m.vs->inputs[s] = {0, m.vs->stream_stride[0], 0x42};
-                m.vs->stream_stride[0] += 16;
-            }
+        m.vs = gpu::MakeImmediateVertexShader(from, g_im_mask);
     }
-    packed.clear();
-    for (uint32_t v = 0; v < count; v++)
-        for (uint32_t s = 0; s < 16; s++)
-            if (g_im_mask >> s & 1) packed.insert(packed.end(), &g_im_vertices[v * 64 + s * 4], &g_im_vertices[v * 64 + s * 4] + 4);
+    gpu::PackImmediateVertices(g_im_mask, count, g_im_vertices.data(), packed);
     g_state.vs = m.vs;
     g_state.vs_handle = handle | 1;
     DrawUp(prim, count, packed.data(), m.vs->stream_stride[0]);

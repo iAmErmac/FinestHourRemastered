@@ -464,6 +464,30 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
     vs.stream_stride[0] = off;
 }
 
+std::shared_ptr<VertexShader> MakeImmediateVertexShader(const std::shared_ptr<VertexShader>& source, uint32_t mask) {
+    auto result = std::make_shared<VertexShader>();
+    if (source) {
+        result->program = source->program;
+        result->program_type = source->program_type;
+    }
+    for (uint32_t slot = 0; slot < 16; ++slot)
+        if ((mask >> slot) & 1) {
+            result->inputs[slot] = {0, result->stream_stride[0], 0x42};
+            result->stream_stride[0] += 16;
+        }
+    return result;
+}
+
+void PackImmediateVertices(uint32_t mask, uint32_t count, const float* slots, std::vector<float>& packed) {
+    packed.clear();
+    packed.reserve(size_t(count) * 16);
+    for (uint32_t vertex = 0; vertex < count; ++vertex)
+        for (uint32_t slot = 0; slot < 16; ++slot)
+            if ((mask >> slot) & 1)
+                packed.insert(packed.end(), slots + size_t(vertex) * 64 + slot * 4,
+                              slots + size_t(vertex) * 64 + slot * 4 + 4);
+}
+
 bool Assemble(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* ip, Assembled& out) {
     ResetAssembled(out);
     if (!count || prim < 1 || prim > 10) return false;

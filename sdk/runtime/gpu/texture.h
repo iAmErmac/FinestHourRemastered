@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -30,6 +31,16 @@ struct TextureDesc {
     bool linear = false;
 };
 
+// The active P8 palette, including the XDK size-code contract and a cached content hash.
+struct PaletteInfo {
+    const uint32_t* colours = nullptr;
+    uint32_t va = 0;
+    size_t bytes = 0;
+    uint64_t hash = 0;
+};
+
+void ReadPalette(const State& state, int stage, const TextureDesc& desc, PaletteInfo& palette);
+
 bool Describe(uint32_t header, TextureDesc& out);
 bool DescribeSurface(const Surface& s, TextureDesc& out);
 uint32_t LevelSize(const TextureDesc& d, uint32_t level);
@@ -37,9 +48,21 @@ uint32_t LevelOffset(const TextureDesc& d, uint32_t level);
 uint32_t FaceSize(const TextureDesc& d);  // cube face stride
 uint32_t TotalSize(const TextureDesc& d);
 
+// A cheap per-frame guest-content check: small resources are hashed whole, larger ones are sampled evenly.
+uint64_t ContentSignature(const TextureDesc& d);
+
 // converts one level (one face) from guest memory into what Host describes, rows tightly packed
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,
                  std::vector<uint8_t>& out, uint32_t& row_pitch);
+
+// Decodes one uncompressed guest texel into the renderer's B, G, R, A order.
+void DecodePixel(uint32_t format, const uint8_t* guest, uint8_t* host);
+
+// Supported synchronous render-target writeback storage and the shared scaled encoder used by Vulkan.
+bool CanWriteBackSurface(const TextureDesc& d);
+bool WriteBackSurface(const TextureDesc& d, const uint8_t* source, uint32_t source_width, uint32_t source_height,
+                      uint32_t source_pitch, size_t source_bytes, uint8_t* guest, size_t guest_bytes,
+                      std::vector<uint8_t>* canonical);
 
 uint32_t LinearColorFormat(uint32_t fmt);
 uint32_t LinearDepthFormat(uint32_t fmt);

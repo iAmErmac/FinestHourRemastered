@@ -30,6 +30,10 @@
 
 namespace gpu {
 
+#ifdef CODF_RENDER_THREAD_TEST_HOOK
+std::atomic<bool> g_threaded_waiting_for_test{false};
+#endif
+
 namespace {
 
 // commands handed over at once, so the render thread keeps close behind and a wait is short
@@ -112,9 +116,16 @@ public:
         if (!done_cv_.wait_for(lock, std::chrono::milliseconds(500), [&] { return exited_; })) (void)inner_.release();
     }
 
-    bool Init(uint32_t width, uint32_t height) override { return inner_->Init(width, height); }
+    bool Init(uint32_t width, uint32_t height) override {
+        if (failed_.load(std::memory_order_acquire)) return false;
+        const bool ok = inner_->Init(width, height);
+        if (!ok && inner_->Failed()) failed_.store(true, std::memory_order_release);
+        return ok;
+    }
+    bool Failed() const override { return failed_.load(std::memory_order_acquire); }
 
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override {
+        if (Failed()) return;
         auto t = diag::Perf() ? Clock::now() : Clock::time_point{};
         SendState(s);
         Cmd c{Op::Draw};
@@ -137,6 +148,7 @@ public:
     }
 
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z, uint32_t stencil) override {
+        if (Failed()) return;
         auto t = diag::Perf() ? Clock::now() : Clock::time_point{};
         SendState(s);
         Cmd c{Op::Clear};
@@ -158,6 +170,7 @@ public:
 
     // rects and points are taken now; the copy itself, CPU or GPU, runs in order like the console's
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override {
+        if (Failed()) return;
         auto t = diag::Perf() ? Clock::now() : Clock::time_point{};
         Cmd c{Op::Copy};
         c.a = count;
@@ -175,6 +188,7 @@ public:
     }
 
     void Present(const Surface& front) override {
+        if (Failed()) return;
         auto t = diag::Perf() ? Clock::now() : Clock::time_point{};
         Cmd c{Op::Present};
         c.s1 = front;
@@ -188,9 +202,13 @@ public:
         last_present_ = id;
     }
 
-    void Sync(uint32_t data, uint32_t) override { ReadBack(data, false); }
+    void Sync(uint32_t data, uint32_t) override {
+        if (Failed()) return;
+        ReadBack(data, false);
+    }
 
     void SyncLate(uint32_t data) override {
+        if (Failed()) return;
         if (!inner_->DeliverLate(data)) {
             if (diag::Perf()) LOG_FIRST(16, "render thread: no finished copy of %08X for a NOOVERWRITE lock, reading it back now", data);
             written_.insert(data);
@@ -202,11 +220,13 @@ public:
     }
 
     void Flush() override {
+        if (Failed()) return;
         cur_->cmds.push_back(Cmd{Op::Flush});
         Wait(Submit(), WaitFor::Flush, "flush");
     }
 
     void SetGamma(const uint8_t* ramp) override {
+        if (Failed()) return;
         Cmd c{Op::Gamma};
         c.data = Put(ramp, 768);
         cur_->cmds.push_back(c);
@@ -214,16 +234,22 @@ public:
 
     uint32_t Fence() override { return uint32_t(cur_->id); }
     bool FencePending(uint32_t fence) override {
+        if (Failed()) return false;
         // a title polling a fence of the batch still being recorded would wait for ever
         if (fence >= cur_->id && !cur_->cmds.empty()) Submit();
         return fence > done_.load();
     }
-    void WaitFence(uint32_t fence) override { Wait(fence, WaitFor::Fence, "fence"); }
+    void WaitFence(uint32_t fence) override {
+        if (Failed()) return;
+        Wait(fence, WaitFor::Fence, "fence");
+    }
     bool Busy(uint32_t resource) override {
+        if (Failed()) return false;
         auto it = last_use_.find(resource);
         return it != last_use_.end() && it->second > done_.load();
     }
     void WaitResource(uint32_t resource) override {
+        if (Failed()) return;
         auto it = last_use_.find(resource);
         if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
     }
@@ -359,6 +385,7 @@ private:
         uint64_t id = cur_->id;
         {
             std::lock_guard lock(m_);
+            if (failed_.load(std::memory_order_acquire)) return id;
             queue_.push_back(cur_);
         }
         cv_.notify_one();
@@ -373,7 +400,15 @@ private:
         {
             std::unique_lock lock(m_);
             want_ = id;  // (the render thread wakes this thread only once it is done)
-            done_cv_.wait(lock, [&] { return done_.load() >= id; });
+#ifdef CODF_RENDER_THREAD_TEST_HOOK
+            g_threaded_waiting_for_test.store(true, std::memory_order_release);
+#endif
+            done_cv_.wait(lock, [&] {
+                return done_.load(std::memory_order_acquire) >= id || failed_.load(std::memory_order_acquire) || exited_;
+            });
+#ifdef CODF_RENDER_THREAD_TEST_HOOK
+            g_threaded_waiting_for_test.store(false, std::memory_order_release);
+#endif
             want_ = 0;
         }
         uint64_t ns = Ns(t);
@@ -399,7 +434,14 @@ private:
                 b = queue_.front();
                 queue_.pop_front();
             }
-            for (const Cmd& c : b->cmds) Execute(*b, c);
+            bool failed = false;
+            for (const Cmd& c : b->cmds) {
+                Execute(*b, c);
+                if (inner_->Failed()) {
+                    failed = true;
+                    break;
+                }
+            }
             uint64_t id = b->id;
             b->cmds.clear();
             b->bytes.clear();
@@ -409,10 +451,18 @@ private:
             {
                 std::lock_guard lock(m_);
                 free_.push_back(b);
-                done_.store(id);
+                if (failed) {
+                    failed_.store(true, std::memory_order_release);
+                    while (!queue_.empty()) {
+                        free_.push_back(queue_.front());
+                        queue_.pop_front();
+                    }
+                }
+                done_.store(id, std::memory_order_release);
                 wake = want_ && id >= want_;
             }
             if (wake) done_cv_.notify_all();
+            if (failed) break;
         }
         std::lock_guard lock(m_);
         exited_ = true;
@@ -481,6 +531,7 @@ private:
     std::deque<Batch*> queue_;
     std::vector<Batch*> free_;
     std::atomic<uint64_t> done_{0};
+    std::atomic<bool> failed_{false};
     bool stop_ = false, exited_ = false;
 };
 

@@ -15,10 +15,81 @@ namespace {
 
 const FormatInfo kUnknown{"unknown", 32, false, false, false, Host::None};
 
+constexpr uint32_t kSignatureWholeMax = 65536;
+constexpr uint32_t kSignatureSamples = 64;
+constexpr uint32_t kSignatureSampleBytes = 64;
+
 struct Entry {
     uint32_t id;
     FormatInfo info;
 };
+
+// P8 palettes are read at every bind, but their content is copied and hashed only when the address,
+// size-code-selected extent or bytes change. This mirrors the D3D12 texture identity contract.
+struct PaletteCache {
+    uint32_t va = 0;
+    size_t bytes = 0;
+    uint32_t colours[256] = {};
+    uint64_t hash = 0;
+};
+
+PaletteCache g_palettes[16];
+
+uint64_t PaletteHash(const void* data, size_t size) {
+    constexpr uint64_t k0 = 0x9E3779B97F4A7C15ull, k1 = 0xE7037ED1A0B428DBull;
+    auto mix = [](uint64_t a, uint64_t b) {
+        unsigned __int128 result = static_cast<unsigned __int128>(a) * b;
+        return uint64_t(result) ^ uint64_t(result >> 64);
+    };
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint64_t seed = 1469598103934665603ull ^ k0;
+    size_t at = 0;
+    for (; at + 16 <= size; at += 16) {
+        uint64_t x, y;
+        std::memcpy(&x, bytes + at, 8);
+        std::memcpy(&y, bytes + at + 8, 8);
+        seed = mix(x ^ k1, y ^ seed);
+    }
+    if (size_t remainder = size - at) {
+        uint64_t x = 0, y = 0;
+        if (remainder >= 8) {
+            std::memcpy(&x, bytes + at, 8);
+            std::memcpy(&y, bytes + size - 8, 8);
+        } else {
+            std::memcpy(&x, bytes + at, remainder);
+        }
+        seed = mix(x ^ k1, y ^ seed ^ remainder);
+    }
+    return mix(seed ^ k0, uint64_t(size) ^ k1);
+}
+
+uint64_t TextureHash(const void* data, size_t size, uint64_t seed) {
+    constexpr uint64_t k0 = 0x9E3779B97F4A7C15ull, k1 = 0xE7037ED1A0B428DBull;
+    auto mix = [](uint64_t a, uint64_t b) {
+        unsigned __int128 result = static_cast<unsigned __int128>(a) * b;
+        return uint64_t(result) ^ uint64_t(result >> 64);
+    };
+    const uint8_t* bytes = static_cast<const uint8_t*>(data);
+    uint64_t state = seed ^ k0;
+    size_t at = 0;
+    for (; at + 16 <= size; at += 16) {
+        uint64_t x, y;
+        std::memcpy(&x, bytes + at, 8);
+        std::memcpy(&y, bytes + at + 8, 8);
+        state = mix(x ^ k1, y ^ state);
+    }
+    if (size_t remainder = size - at) {
+        uint64_t x = 0, y = 0;
+        if (remainder >= 8) {
+            std::memcpy(&x, bytes + at, 8);
+            std::memcpy(&y, bytes + size - 8, 8);
+        } else {
+            std::memcpy(&x, bytes + at, remainder);
+        }
+        state = mix(x ^ k1, y ^ state ^ remainder);
+    }
+    return mix(state ^ k0, uint64_t(size) ^ k1);
+}
 
 // console texture formats (XDK D3DFORMAT values) and how they reach the host
 const Entry kFormats[] = {
@@ -302,6 +373,29 @@ bool DescribeSurface(const Surface& s, TextureDesc& d) {
     return Describe(s.header, d);
 }
 
+void ReadPalette(const State& state, int stage, const TextureDesc& desc, PaletteInfo& palette) {
+    palette = {};
+    constexpr uint32_t kFormatP8 = 0x0B;
+    constexpr uint32_t kPaletteData = 4;
+    constexpr uint32_t kPaletteSizeShift = 30;
+    if (stage < 0 || stage >= 4 || desc.format != kFormatP8 || !state.palettes[size_t(stage)]) return;
+    const uint32_t header = state.palettes[size_t(stage)];
+    palette.va = mem::VirtualFromPhysical(kernel::R32(header + kPaletteData));
+    const uint32_t size_code = kernel::R32(header) >> kPaletteSizeShift;
+    palette.bytes = sizeof(g_palettes[0].colours) >> size_code;
+    const void* source = kernel::HostPtr(palette.va);
+    PaletteCache& cache = g_palettes[(palette.va >> 4) & 15];
+    if (cache.va != palette.va || cache.bytes != palette.bytes || std::memcmp(cache.colours, source, palette.bytes)) {
+        std::memset(cache.colours, 0, sizeof(cache.colours));
+        std::memcpy(cache.colours, source, palette.bytes);
+        cache.va = palette.va;
+        cache.bytes = palette.bytes;
+        cache.hash = PaletteHash(cache.colours, sizeof(cache.colours));
+    }
+    palette.colours = cache.colours;
+    palette.hash = cache.hash;
+}
+
 uint32_t LevelSize(const TextureDesc& d, uint32_t level) {
     const FormatInfo& f = Format(d.format);
     if (d.linear) return d.pitch * d.height;
@@ -319,6 +413,18 @@ uint32_t LevelOffset(const TextureDesc& d, uint32_t level) {
 uint32_t FaceSize(const TextureDesc& d) { return (LevelOffset(d, d.levels) + 127) & ~127u; }
 
 uint32_t TotalSize(const TextureDesc& d) { return d.cube ? FaceSize(d) * 6 : LevelOffset(d, d.levels); }
+
+uint64_t ContentSignature(const TextureDesc& d) {
+    const uint32_t total = TotalSize(d);
+    const uint8_t* data = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
+    uint64_t signature = TextureHash(&total, sizeof(total), 1469598103934665603ull);
+    if (total <= kSignatureWholeMax) return TextureHash(data, total, signature);
+    for (uint32_t i = 0; i < kSignatureSamples; ++i) {
+        const uint8_t* sample = data + uint64_t(total - kSignatureSampleBytes) * i / (kSignatureSamples - 1);
+        signature = TextureHash(sample, kSignatureSampleBytes, signature);
+    }
+    return signature;
+}
 
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,
                  std::vector<uint8_t>& out, uint32_t& row_pitch) {
@@ -393,6 +499,86 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
             }
 }
 
+void DecodePixel(uint32_t format, const uint8_t* guest, uint8_t* host) { Texel(format, guest, host); }
+
+bool CanWriteBackSurface(const TextureDesc& d) {
+    if (!d.linear || d.cube || d.depth != 1 || Format(d.format).compressed || Format(d.format).bits != 32)
+        return false;
+    switch (d.format) {
+        case 0x12:  // LIN_A8R8G8B8: guest byte order is BGRA
+        case 0x1E:  // LIN_X8R8G8B8: guest byte order is BGRX
+        case 0x3F:  // LIN_A8B8G8R8: guest byte order is RGBA
+        case 0x40:  // LIN_B8G8R8A8: guest byte order is ARGB
+        case 0x41:  // LIN_R8G8B8A8: guest byte order is ABGR
+            return true;
+        default:
+            return false;
+    }
+}
+
+namespace {
+
+void EncodeWritebackPixel(uint32_t format, const uint8_t* bgra, uint8_t* guest) {
+    switch (format) {
+        case 0x12:
+            std::memcpy(guest, bgra, 4);
+            break;
+        case 0x1E:
+            std::memcpy(guest, bgra, 3);
+            guest[3] = 0xFF;
+            break;
+        case 0x3F:
+            guest[0] = bgra[2];
+            guest[1] = bgra[1];
+            guest[2] = bgra[0];
+            guest[3] = bgra[3];
+            break;
+        case 0x40:
+            guest[0] = bgra[3];
+            guest[1] = bgra[2];
+            guest[2] = bgra[1];
+            guest[3] = bgra[0];
+            break;
+        case 0x41:
+            guest[0] = bgra[3];
+            guest[1] = bgra[0];
+            guest[2] = bgra[1];
+            guest[3] = bgra[2];
+            break;
+        default:
+            break;
+    }
+}
+
+}  // namespace
+
+bool WriteBackSurface(const TextureDesc& d, const uint8_t* source, uint32_t source_width, uint32_t source_height,
+                      uint32_t source_pitch, size_t source_bytes, uint8_t* guest, size_t guest_bytes,
+                      std::vector<uint8_t>* canonical) {
+    if (!CanWriteBackSurface(d) || !d.width || !d.height || !source || !source_width || !source_height || !guest ||
+        source_pitch < uint64_t(source_width) * 4 || d.pitch < uint64_t(d.width) * 4)
+        return false;
+    const size_t required_source = size_t(source_pitch) * source_height;
+    const size_t required_guest = size_t(d.pitch) * d.height;
+    const size_t required_canonical = size_t(d.width) * d.height * 4;
+    if (required_source / source_height != source_pitch || required_guest / d.height != d.pitch ||
+        required_canonical / (size_t(d.height) * 4) != d.width || source_bytes < required_source ||
+        guest_bytes < required_guest)
+        return false;
+    if (canonical) canonical->assign(required_canonical, 0);
+    for (uint32_t y = 0; y < d.height; ++y) {
+        const uint32_t source_y = std::min(source_height - 1, uint32_t(uint64_t(y) * source_height / d.height));
+        for (uint32_t x = 0; x < d.width; ++x) {
+            const uint32_t source_x = std::min(source_width - 1, uint32_t(uint64_t(x) * source_width / d.width));
+            const uint8_t* bgra = source + size_t(source_y) * source_pitch + source_x * 4;
+            uint8_t* encoded = guest + size_t(y) * d.pitch + x * 4;
+            EncodeWritebackPixel(d.format, bgra, encoded);
+            if (canonical) DecodePixel(d.format, encoded, canonical->data() + (size_t(y) * d.width + x) * 4);
+        }
+    }
+    return true;
+}
+
 uint32_t LinearColorFormat(uint32_t f) {
     switch (f) {
         case 0x06: return 0x12;
@@ -453,6 +639,19 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
         if (block) return d.data + (y * ((d.width + 3) / 4) + x) * bpp;
         return d.data + (d.linear ? y * d.pitch + x * bpp : (Deposit(x, mx) | Deposit(y, my)) * bpp);
     };
+    // CopyRects may target the same guest allocation. Snapshot the source bytes first so an overlapping move has
+    // the console's read-before-write behavior instead of copying in traversal order.
+    std::vector<uint8_t> source_snapshot;
+    if (a.data == b.data) {
+        const uint32_t bytes = TotalSize(a);
+        if (!bytes) return false;
+        source_snapshot.resize(bytes);
+        std::memcpy(source_snapshot.data(), kernel::HostPtr(a.data), bytes);
+    }
+    auto source_ptr = [&](uint32_t address) -> const uint8_t* {
+        if (source_snapshot.empty()) return static_cast<const uint8_t*>(kernel::HostPtr(address));
+        return source_snapshot.data() + (address - a.data);
+    };
     int32_t aw = int32_t((a.width + u - 1) / u), ah = int32_t((a.height + u - 1) / u);
     int32_t bw = int32_t((b.width + u - 1) / u), bh = int32_t((b.height + u - 1) / u);
     uint32_t n = count && rects ? count : 1;
@@ -478,7 +677,7 @@ bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, u
                 int32_t tx = dx + x - x0, ty = dy + y - y0;
                 if (tx < 0 || ty < 0 || tx >= bw || ty >= bh) continue;
                 std::memcpy(kernel::HostPtr(addr(b, bx, by, uint32_t(tx), uint32_t(ty))),
-                            kernel::HostPtr(addr(a, ax, ay, uint32_t(x), uint32_t(y))), bpp);
+                            source_ptr(addr(a, ax, ay, uint32_t(x), uint32_t(y))), bpp);
             }
     }
     MarkDirty(dst.header);

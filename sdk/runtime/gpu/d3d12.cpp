@@ -50,6 +50,8 @@
 #include "gpu/smaa_textures.h"
 #include "gpu/motion_shaders.h"
 #include "gpu/shaders.h"
+#include "gpu/draw_constants.h"
+#include "gpu/gamma.h"
 #include "gpu/shadow_shaders.h"
 #include "gpu/shadows.h"
 #include "gpu/texture.h"
@@ -440,10 +442,6 @@ struct Tex {
 
 // a remastered texture on the GPU: colour, and for a material its normal and material maps
 class D3D12Backend;
-D3D12Backend* g_ui_backend = nullptr;  // inside the overlay's frame
-std::mutex g_override_lock;
-std::vector<TextureOverride> g_override_set;
-bool g_override_new = false;
 
 struct RemasterTex {
     ComPtr<ID3D12Resource> color, normal, mat;
@@ -593,7 +591,7 @@ struct StampTable {
     }
 };
 
-class D3D12Backend final : public Backend, public Context {
+class D3D12Backend final : public Backend, public UiServices, public Context {
 public:
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
@@ -1418,7 +1416,8 @@ private:
     uint32_t ui_used_ = 1;
 
   public:
-    uint64_t UiImage(const std::string& key, const remaster::Image* im);
+    uint64_t UiImage(const std::string& key, const remaster::Image* im, bool source_missing) override;
+    bool TvScreen(float rect[4]) override;
 
   private:
     uint32_t srv_inc_ = 0;
@@ -3591,51 +3590,12 @@ void FillTextureView(const Tex& tx, const TextureDesc& d, D3D12_SHADER_RESOURCE_
     }
 }
 
-// a P8 texture's palette: its colours, their address (part of the texture's key) and their hash, all 0 without one
-struct StagePalette {
-    const uint32_t* colours = nullptr;  // 256 (fewer by the size code, the rest 0)
-    uint32_t va = 0;
-    uint64_t hash = 0;
-};
-// the palettes as last read, by their address: the same bytes again keep their hash (a P8 texture's palette is read
-// at every bind; hashing it each time was a share of the draws' cost)
-struct PaletteCache {
-    uint32_t va = 0;
-    size_t bytes = 0;
-    uint32_t colours[256] = {};
-    uint64_t hash = 0;
-};
-PaletteCache g_palettes[16];
-
-// a P8 texture is decoded with the stage's palette: 256 colours, fewer by the size code in the top two bits
-void ReadStagePalette(const State& s, int stage, const TextureDesc& d, StagePalette& palette) {
-    constexpr uint32_t kFmtP8 = 0x0B;          // D3DFMT_P8
-    constexpr uint32_t kPaletteCommon = 0;     // D3DPalette: Common, its top two bits the size code
-    constexpr uint32_t kPaletteData = 4;       // D3DPalette: Data, physical address of the colours
-    constexpr uint32_t kPaletteSizeShift = 30;
-    if (d.format != kFmtP8 || !s.palettes[size_t(stage)]) return;
-    uint32_t header = s.palettes[size_t(stage)];
-    palette.va = mem::VirtualFromPhysical(kernel::R32(header + kPaletteData));
-    uint32_t size_code = kernel::R32(header + kPaletteCommon) >> kPaletteSizeShift;
-    size_t bytes = (std::size(g_palettes[0].colours) >> size_code) * sizeof(uint32_t);
-    const void* src = kernel::HostPtr(palette.va);
-    PaletteCache& e = g_palettes[(palette.va >> 4) & 15];
-    if (e.va != palette.va || e.bytes != bytes || std::memcmp(e.colours, src, bytes)) {
-        std::memset(e.colours, 0, sizeof(e.colours));
-        std::memcpy(e.colours, src, bytes);
-        e.va = palette.va, e.bytes = bytes;
-        e.hash = Hash(e.colours, sizeof(e.colours));
-    }
-    palette.colours = e.colours;
-    palette.hash = e.hash;
-}
-
 // a texture in guest memory: made again when its layout changed, uploaded again when its bytes did
 ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                                DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
-    StagePalette palette;
-    ReadStagePalette(s, stage, d, palette);
+    PaletteInfo palette;
+    ReadPalette(s, stage, d, palette);
     const uint64_t key = uint64_t(palette.va) << 32 | d.data;
     Tex& tx = textures_[key];
     uint32_t total = TotalSize(d);
@@ -3957,52 +3917,6 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
     KeyRasterizer(s, a, k);
 }
 
-// alpha test off: compare always, in Cmp() minus 1 terms like the enabled test
-constexpr float kAlphaTestAlways = float(D3D12_COMPARISON_FUNC_ALWAYS - 1);
-
-// D3DRS_FOGTABLEMODE values
-constexpr uint32_t kFogTableNone = 0;
-constexpr float kFogTableLinear = 3.0f;
-
-// table mode none under a vertex program: oFog is the blend factor, passed on as linear fog from 1 to 0
-void FillFogConstants(const State& s, bool vertex_program, DrawConstants& c) {
-    if (!s.rs[kRsFogEnable]) return;
-    if (vertex_program && s.rs[kRsFogTableMode] == kFogTableNone) {
-        c.fog[0] = 1.0f;
-        c.fog[1] = 0.0f;
-        c.fog[2] = 0.0f;
-        c.fog[3] = kFogTableLinear;
-        return;
-    }
-    c.fog[0] = Bits(s.rs[kRsFogStart]);
-    c.fog[1] = Bits(s.rs[kRsFogEnd]);
-    c.fog[2] = Bits(s.rs[kRsFogDensity]);
-    c.fog[3] = float(s.rs[kRsFogTableMode]);
-}
-
-void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
-    c.surf[0] = float(size.w);
-    c.surf[1] = float(size.h);
-    c.surf[2] = 1.0f / s.zscale;
-    Color(s.rs[kRsFogColor], c.fog_color);
-    c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
-    c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(Cmp(SimpleState(s, kMAlphaFunc)) - 1) : kAlphaTestAlways;
-    c.misc[2] = float(Cmp(s.rs[kRsShadowFunc]) - 1);
-    c.misc[3] = s.rs[kRsSpecularEnable] ? 1.0f : 0.0f;
-    if (c.layout[0] == 0) c.layout[0] = 1;  // Layout2D's, else as drawn
-    if (c.layout_y[0] == 0) c.layout_y[0] = 1;
-}
-
-void FillCombinerConstants(const State& s, DrawConstants& c) {
-    for (int i = 0; i < 8; i++) {
-        Color(SimpleState(s, kMPsConstant0 + i * 4), c.pc[i * 2]);
-        Color(SimpleState(s, kMPsConstant1 + i * 4), c.pc[i * 2 + 1]);
-    }
-    Color(SimpleState(s, kMPsFinalConstant0), c.pc[16]);
-    Color(SimpleState(s, kMPsFinalConstant1), c.pc[17]);
-    Color(s.rs[kRsTextureFactor], c.tfactor);
-}
-
 constexpr float kGlowBoxTexels = 3.0f;  // console texels across the box each wide tap averages
 
 void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c) {
@@ -4114,50 +4028,15 @@ constexpr int kLightAttenuation2 = 23;
 constexpr int kLightTheta = 24;
 constexpr int kLightPhi = 25;
 
-void LightToView(const std::array<uint32_t, kLightFloats>& l, const float* vm, float (&o)[7][4]) {
-    float f[kLightFloats];
-    std::memcpy(f, l.data(), sizeof(f));
-    for (int j = 0; j < 4; j++) {
-        o[0][j] = f[kLightDiffuse + j];
-        o[1][j] = f[kLightSpecular + j];
-        o[2][j] = f[kLightAmbient + j];
-    }
-    const float* pos = f + kLightPosition;
-    const float* dir = f + kLightDirection;
-    for (int j = 0; j < 3; j++) {
-        o[3][j] = pos[0] * vm[j] + pos[1] * vm[4 + j] + pos[2] * vm[8 + j] + vm[12 + j];
-        o[4][j] = dir[0] * vm[j] + dir[1] * vm[4 + j] + dir[2] * vm[8 + j];
-    }
-    o[3][3] = f[kLightRange];
-    o[4][3] = f[kLightFalloff];
-    o[5][0] = f[kLightAttenuation0];
-    o[5][1] = f[kLightAttenuation1];
-    o[5][2] = f[kLightAttenuation2];
-    o[6][0] = std::cos(f[kLightTheta] * 0.5f);
-    o[6][1] = std::cos(f[kLightPhi] * 0.5f);
-}
-
-void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
-    std::memcpy(c.mat, s.material.data(), sizeof(float) * 16);
-    c.mat[4][0] = s.material[16];
-    Color(s.rs[kRsAmbient], c.amb);
-    // lights to view space
-    const float* vm = s.transforms[kTsView].data();
-    for (int i = 0; i < 8; i++) {
-        if (!((fk.types >> (i * 2)) & 3)) continue;
-        LightToView(s.lights[size_t(i)], vm, c.lt[i]);
-    }
-}
-
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                                    GuestExtent size, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc) + kShadowConstantsTail, 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     last_vc_ = vc.gpu, last_tail_ = vc.cpu + sizeof(s.vsc);
     Alloc dc = Upload(sizeof(DrawConstants), 256);
-    FillSurfaceConstants(s, size, c);
-    FillFogConstants(s, sh.prog, c);
-    FillCombinerConstants(s, c);
+    draw_constants::Surface(s, size.w, size.h, c);
+    draw_constants::Fog(s, sh.prog, c);
+    draw_constants::Combiners(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
     FillTextureConstants(s, stages, c);
     if (stages.mat) {
@@ -4305,7 +4184,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     }
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
-        FillLightConstants(s, sh.fk, c);
+        draw_constants::Lights(s, sh.fk, c);
     }
     std::memcpy(dc.cpu, &c, sizeof(c));
     last_dc_ = dc.gpu;
@@ -5685,25 +5564,18 @@ void D3D12Backend::UploadGammaRamp() {
     constexpr uint32_t kRampBytes = 256 * 4;  // one BGRA texel per ramp entry
     ramp_dirty_ = false;
     Alloc a = Upload(kRampBytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-    bool identity = true;
-    // the game's ramp, then the player's brightness: a gamma over it
     brightness_ = app::Get().brightness;
-    const double g = 100.0 / std::max(brightness_, 1u);
-    auto curve = [&](uint8_t v) { return uint8_t(std::lround(255.0 * std::pow(v / 255.0, g))); };
-    // the title's ramp, the identity until it sets one
-    bool set = false;
-    for (uint8_t v : ramp_) set |= v != 0;
-    if (!set)
-        for (int i = 0; i < 256; i++) ramp_[kRampRed + i] = ramp_[kRampGreen + i] = ramp_[kRampBlue + i] = uint8_t(i);
+    std::array<uint8_t, 768> lut{};
+    bool effective = false;
+    BuildGammaLut(ramp_, brightness_, lut.data(), effective);
     for (int i = 0; i < 256; i++) {
         uint8_t* p = a.cpu + i * 4;
-        p[0] = curve(ramp_[kRampBlue + i]);
-        p[1] = curve(ramp_[kRampGreen + i]);
-        p[2] = curve(ramp_[kRampRed + i]);
+        p[0] = lut[kRampBlue + i];
+        p[1] = lut[kRampGreen + i];
+        p[2] = lut[kRampRed + i];
         p[3] = 255;
-        identity &= p[2] == i && p[1] == i && p[0] == i;
     }
-    gamma_ = !identity;
+    gamma_ = effective;
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION dl{lut_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -9474,12 +9346,7 @@ struct D3D12Backend::Streamer {
 // the game's replacement textures when it changed them: each with its mips, a box filter down
 void D3D12Backend::PumpOverrides() {
     std::vector<TextureOverride> set;
-    {
-        std::lock_guard l(g_override_lock);
-        if (!g_override_new) return;
-        g_override_new = false;
-        set = std::move(g_override_set);
-    }
+    if (!TakeTextureOverrides(set)) return;
     for (auto& [id, o] : overrides_) Release(std::move(o.res));
     overrides_.clear();
     for (const TextureOverride& o : set) {
@@ -9761,7 +9628,7 @@ void D3D12Backend::BlitFrame(Target& t, ID3D12Resource* src, DXGI_FORMAT fmt) {
 }
 
 // a picture for the overlay in the next slot of ImGui's heap, once per key
-uint64_t D3D12Backend::UiImage(const std::string& key, const remaster::Image* im) {
+uint64_t D3D12Backend::UiImage(const std::string& key, const remaster::Image* im, bool) {
     auto it = ui_tex_.find(key);
     if (it != ui_tex_.end()) return it->second.id;
     UiTex t;
@@ -9785,9 +9652,8 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
-    g_ui_backend = this;
+    UiScope ui_scope(this);
     if (app::kGame.ui) app::kGame.ui(fps_);
-    g_ui_backend = nullptr;
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
@@ -10472,36 +10338,12 @@ void D3D12Backend::SetGamma(const uint8_t* ramp) {
 
 }  // namespace
 
-std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+std::unique_ptr<Backend> CreateD3D12Backend() { return std::make_unique<D3D12Backend>(); }
 
-bool TvScreen(float rect[4]) {
-    if (!g_ui_backend || !g_ui_backend->tv_on_) return false;
-    std::memcpy(rect, g_ui_backend->tv_rect_, sizeof(float) * 4);
+bool D3D12Backend::TvScreen(float rect[4]) {
+    if (!tv_on_) return false;
+    std::memcpy(rect, tv_rect_, sizeof(float) * 4);
     return true;
-}
-
-uint64_t UiTexture(const std::string& pack_path) {
-    if (!g_ui_backend) return 0;
-    std::filesystem::path p = std::filesystem::path(remaster::Dir()) / pack_path;
-    remaster::Image im;
-    bool ok = std::filesystem::exists(p) && remaster::ReadDds(p.wstring(), im);
-    return g_ui_backend->UiImage("pack:" + pack_path, ok ? &im : nullptr);
-}
-
-uint64_t UiImage(const std::string& name, uint32_t w, uint32_t h, const uint8_t* rgba) {
-    if (!g_ui_backend) return 0;
-    remaster::Image im;
-    im.fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
-    im.w = w, im.h = h, im.mips = 1;
-    im.offsets = {0};
-    im.data.assign(rgba, rgba + size_t(w) * h * 4);
-    return g_ui_backend->UiImage("img:" + name, &im);
-}
-
-void SetTextureOverrides(std::vector<TextureOverride> set) {
-    std::lock_guard l(g_override_lock);
-    g_override_set = std::move(set);
-    g_override_new = true;
 }
 
 }  // namespace gpu

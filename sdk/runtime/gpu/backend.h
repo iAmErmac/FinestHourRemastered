@@ -5,6 +5,11 @@
 #include <vector>
 #include <cstdint>
 #include <memory>
+#include <string>
+
+namespace gpu::remaster {
+struct Image;
+}
 
 #include "gpu/state.h"
 
@@ -17,11 +22,33 @@ enum : uint32_t {
     kClearStencil = 0x02,
 };
 
+class UiServices {
+public:
+    virtual ~UiServices() = default;
+    virtual uint64_t UiImage(const std::string&, const remaster::Image*, bool source_missing) = 0;
+    virtual bool TvScreen(float[4]) = 0;
+};
+
+class UiScope {
+public:
+    explicit UiScope(UiServices* services);
+    UiScope(const UiScope&) = delete;
+    UiScope& operator=(const UiScope&) = delete;
+    ~UiScope();
+
+private:
+    UiServices* previous_ = nullptr;
+};
+
+extern thread_local UiServices* g_ui_services;
+
 class Backend {
 public:
     virtual ~Backend() = default;
     // the title's back buffer size, the output window may differ
     virtual bool Init(uint32_t width, uint32_t height) = 0;
+    // A backend that records work asynchronously can report a terminal error without touching the title thread.
+    virtual bool Failed() const { return false; }
     // rects: count D3DRECTs (4 x int32), null for the whole viewport
     virtual void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                        uint32_t stencil) = 0;
@@ -52,9 +79,15 @@ private:
     uint32_t fence_ = 0;
 };
 
+std::unique_ptr<Backend> CreateD3D12Backend();
 std::unique_ptr<Backend> CreateBackend();
 // the same backend driven from a thread of its own: calls return once recorded
 std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
+
+#ifdef CODF_RENDER_THREAD_TEST_HOOK
+// Private offscreen fixtures use this to release a forced backend failure only after Wait has entered its predicate.
+extern std::atomic<bool> g_threaded_waiting_for_test;
+#endif
 
 // perf diagnostic: the title's thread recording for the render thread, and waiting on it
 inline std::atomic<uint64_t> g_perf_capture_ns{0}, g_perf_wait_ns{0}, g_perf_waits{0};
@@ -179,6 +212,7 @@ struct TextureOverride {
     std::vector<uint8_t> rgba;
 };
 void SetTextureOverrides(std::vector<TextureOverride> set);  // any thread
+bool TakeTextureOverrides(std::vector<TextureOverride>& set); // render thread
 // A DDS of the remaster pack (its path under the pack's folder) for the overlay's drawing: an ImTextureID, 0 when
 // the pack has none. Inside the overlay's frame (GameInfo::ui), loaded once.
 uint64_t UiTexture(const std::string& pack_path);

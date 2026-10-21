@@ -1,6 +1,7 @@
 #pragma once
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "gpu/state.h"
@@ -54,6 +55,10 @@ struct Assembled {
 
 // the FVF bits translated to the register layout the XDK's declarations use
 void FvfInputs(uint32_t fvf, VertexShader& out);
+
+// Immediate-mode vertices are packed into a synthetic declaration before the ordinary assembler sees them.
+std::shared_ptr<VertexShader> MakeImmediateVertexShader(const std::shared_ptr<VertexShader>& source, uint32_t mask);
+void PackImmediateVertices(uint32_t mask, uint32_t count, const float* slots, std::vector<float>& packed);
 
 // false when there is nothing to draw
 // indices: the title's 16 bit indices, null for an unindexed draw
