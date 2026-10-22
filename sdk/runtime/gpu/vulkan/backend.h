@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/backend.h"
+#include "core/diag.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -9,6 +10,7 @@
 #include "gpu/vulkan/commands.h"
 #include "gpu/vulkan/context.h"
 #include "gpu/vulkan/descriptors.h"
+#include "gpu/vulkan/draw_dispatch.h"
 #include "gpu/vulkan/image.h"
 #include "gpu/vulkan/late_readback.h"
 #include "gpu/vulkan/pipeline_state.h"
@@ -127,6 +129,7 @@ private:
         uint32_t address_u = 0, address_v = 0, address_w = 0;
         uint32_t mip_lod_bias = 0, max_mip_level = 0, max_anisotropy = 0, border_color = 0;
         uint32_t compare_enable = 0, compare_op = VK_COMPARE_OP_ALWAYS;
+        VkFormat sampled_format = VK_FORMAT_UNDEFINED;
         bool operator==(const SamplerKey&) const = default;
     };
     struct SamplerHash {
@@ -139,6 +142,7 @@ private:
             add(key.address_u); add(key.address_v); add(key.address_w);
             add(key.mip_lod_bias); add(key.max_mip_level); add(key.max_anisotropy); add(key.border_color);
             add(key.compare_enable); add(key.compare_op);
+            add(key.sampled_format);
             return hash;
         }
     };
@@ -171,6 +175,8 @@ private:
     bool RenderUi(const vulkan::AcquireResult& acquired);
     bool FlushUiUploads(const vulkan::AcquireResult& acquired);
     bool InitPerfQueries(uint32_t forced_interval = 0);
+    bool LoadDrawDispatch();
+    void ClearDrawDispatch();
     void ReportCapabilities();
     void ResetPerfQueries();
     void BeginPerfFrame();
@@ -208,7 +214,7 @@ private:
     void StampLateSubmissions();
     void PublishLateCompletion();
 
-    VkSampler SamplerFor(const State& state, int stage, bool shadow);
+    VkSampler SamplerFor(const State& state, int stage, bool shadow, VkFormat sampled_format);
     VkPrimitiveTopology Topology(const Assembled& assembled) const;
 
     vulkan::Context context_;
@@ -244,6 +250,7 @@ private:
     std::vector<std::unique_ptr<vulkan::Image>> frame_images_;
     std::vector<VkSampler> samplers_;
     std::unordered_map<SamplerKey, VkSampler, SamplerHash> stage_samplers_;
+    uint32_t custom_border_sampler_count_ = 0;
     std::unordered_map<VkImage, VkImageLayout> external_layouts_;
 
     struct LateSlot {
@@ -295,6 +302,7 @@ private:
     uint32_t brightness_ = 0;
     uint8_t gamma_[768] = {};
     uint8_t gamma_lut_[768] = {};
+    vulkan::DrawDispatch draw_dispatch_;
 
     struct UiTex {
         std::unique_ptr<vulkan::Image> image;
@@ -322,6 +330,9 @@ private:
     // Optional bounded diagnostics. They are enabled only with XBE_VK_PERF and have no
     // effect on normal rendering when the variable is absent.
     bool perf_enabled_ = false;
+    // Detail timing is opt-in and only records while the existing perf trace control is armed.
+    bool perf_detail_enabled_ = false;
+    bool perf_detail_frame_active_ = false;
     uint32_t perf_interval_ = 0;
     VkQueryPool perf_query_pool_ = VK_NULL_HANDLE;
     bool perf_frame_active_ = false;
@@ -333,9 +344,20 @@ private:
     uint64_t perf_current_source_hits_ = 0;
     uint64_t perf_current_source_misses_ = 0;
     uint64_t perf_current_texture_uploads_ = 0;
-    uint64_t perf_current_descriptor_sets_ = 0;
+    uint64_t perf_current_descriptor_requests_ = 0;
     uint64_t perf_current_record_ns_ = 0;
     uint64_t perf_current_wait_ns_ = 0;
+    uint64_t perf_current_detail_vertex_assembly_ns_ = 0;
+    uint64_t perf_current_detail_texture_target_sampler_ns_ = 0;
+    uint64_t perf_current_detail_pipeline_source_ns_ = 0;
+    uint64_t perf_current_detail_constant_vertex_index_upload_ns_ = 0;
+    uint64_t perf_current_detail_descriptor_lookup_allocation_ns_ = 0;
+    uint64_t perf_current_detail_command_recording_ns_ = 0;
+    uint64_t perf_current_detail_swapchain_render_wait_ns_ = 0;
+    uint64_t perf_current_detail_batch_completion_wait_ns_ = 0;
+    uint64_t perf_current_detail_late_publish_ns_ = 0;
+    uint64_t perf_current_detail_descriptor_retire_ns_ = 0;
+    uint64_t perf_current_detail_resource_retire_ns_ = 0;
     uint64_t perf_current_upload_allocations_ = 0;
     uint64_t perf_current_upload_bytes_ = 0;
     uint64_t perf_current_upload_block_grows_ = 0;
@@ -349,7 +371,7 @@ private:
     uint64_t perf_window_source_hits_ = 0;
     uint64_t perf_window_source_misses_ = 0;
     uint64_t perf_window_texture_uploads_ = 0;
-    uint64_t perf_window_descriptor_sets_ = 0;
+    uint64_t perf_window_descriptor_requests_ = 0;
     uint64_t perf_window_record_ns_ = 0;
     uint64_t perf_window_wait_ns_ = 0;
     uint64_t perf_window_upload_allocations_ = 0;
@@ -360,6 +382,9 @@ private:
     uint64_t perf_window_gpu_samples_ = 0;
     double perf_window_gpu_ms_ = 0.0;
     std::chrono::steady_clock::time_point perf_frame_start_;
+    diag::PerfTrace perf_trace_{"vulkan"};
+    double perf_current_frame_ms_ = 0.0;
+    uint64_t perf_trace_frame_index_ = 0;
 };
 
 std::unique_ptr<Backend> CreateVulkanBackend();

@@ -75,6 +75,9 @@ std::atomic<int> g_dx{0}, g_dy{0};
 std::atomic<int64_t> g_wheel_until[2] = {0, 0};  // up, down: held until this time (ms)
 std::atomic<bool> g_in_game{false};
 std::atomic<int> g_rebind{-1};
+std::mutex g_clip_lock;
+bool g_clip_owned = false;
+RECT g_owned_clip{};
 int g_rebind_slot = 0;
 using Clock = std::chrono::steady_clock;
 Clock::time_point g_last_look = Clock::now();
@@ -110,15 +113,43 @@ bool Pressed(Action a) {
     return down(g_keys.key[a][0]) || down(g_keys.key[a][1]);
 }
 
+void ReleaseClipLocked() {
+    if (!g_clip_owned) return;
+    RECT current{};
+    if (!GetClipCursor(&current)) return;
+    if (!EqualRect(&current, &g_owned_clip)) {
+        g_clip_owned = false;
+        return;
+    }
+    if (ClipCursor(nullptr)) g_clip_owned = false;
+}
+
 void Clip() {
-    if (!g_hwnd) return;
-    if (g_in_game && Active()) {
-        RECT r;
-        GetClientRect(g_hwnd, &r);
-        MapWindowPoints(g_hwnd, nullptr, reinterpret_cast<POINT*>(&r), 2);
-        ClipCursor(&r);
-    } else {
-        ClipCursor(nullptr);
+    std::lock_guard lock(g_clip_lock);
+    if (!g_hwnd) {
+        ReleaseClipLocked();
+        return;
+    }
+    if (!(g_in_game && Active())) {
+        ReleaseClipLocked();
+        return;
+    }
+    RECT r{};
+    if (!GetClientRect(g_hwnd, &r)) {
+        ReleaseClipLocked();
+        return;
+    }
+    SetLastError(ERROR_SUCCESS);
+    const int mapped = MapWindowPoints(g_hwnd, nullptr, reinterpret_cast<POINT*>(&r), 2);
+    if (mapped == 0 && GetLastError() != ERROR_SUCCESS) {
+        ReleaseClipLocked();
+        return;
+    }
+    RECT current{};
+    if (g_clip_owned && GetClipCursor(&current) && EqualRect(&current, &r)) return;
+    if (ClipCursor(&r)) {
+        g_clip_owned = true;
+        g_owned_clip = r;
     }
 }
 
@@ -248,6 +279,10 @@ void Save(void* table) {
 }
 
 void Window(void* hwnd) {
+    {
+        std::lock_guard lock(g_clip_lock);
+        ReleaseClipLocked();
+    }
     g_hwnd = static_cast<HWND>(hwnd);
     RAWINPUTDEVICE rid{0x01, 0x02, 0, g_hwnd};  // generic desktop, mouse
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) LOGW("input: raw mouse input not registered (%lu)", GetLastError());

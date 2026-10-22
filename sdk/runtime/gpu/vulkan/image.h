@@ -21,6 +21,7 @@ public:
     VkImageView View() const { return view_; }
     // Depth/stencil images keep an attachment view and a depth-only sampled view.
     VkImageView SampledView() const { return sampled_view_ ? sampled_view_ : view_; }
+    VkFormat Format() const { return format_; }
     uint32_t MipLevels() const { return mip_levels_; }
     uint32_t ArrayLayers() const { return array_layers_; }
 
@@ -29,6 +30,7 @@ private:
     VkImage image_ = VK_NULL_HANDLE;
     VkImageView view_ = VK_NULL_HANDLE;
     VkImageView sampled_view_ = VK_NULL_HANDLE;
+    VkFormat format_ = VK_FORMAT_UNDEFINED;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     uint32_t mip_levels_ = 1;
     uint32_t array_layers_ = 1;

@@ -5,7 +5,9 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace gpu::vulkan {
@@ -48,6 +50,8 @@ public:
     bool Init(const Context& context, uint32_t sets_per_pool, std::string& error);
     void Reset();
 
+    // Identical immutable resources may reuse a set within the current command batch. Dynamic offsets are
+    // supplied separately by Bind and are never part of the cache identity.
     bool Allocate(const DescriptorResources& resources, DescriptorSet& set, std::string& error);
     bool Bind(VkCommandBuffer command, VkPipelineLayout pipeline_layout, const DescriptorSet& set,
               const std::array<uint32_t, kDynamicConstantBindingCount>& dynamic_offsets,
@@ -70,6 +74,25 @@ public:
                   std::string& error) const;
 
 private:
+    struct DescriptorKey {
+        VkBuffer constant_buffer = VK_NULL_HANDLE;
+        VkDeviceSize constant_buffer_size = 0;
+        VkDeviceSize constant_range = 0;
+        std::array<VkImageView, kTextureBindingCount> textures{};
+        std::array<VkSampler, kSamplerBindingCount> samplers{};
+        VkImageLayout texture_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        bool operator==(const DescriptorKey& other) const {
+            return constant_buffer == other.constant_buffer && constant_buffer_size == other.constant_buffer_size &&
+                   constant_range == other.constant_range && textures == other.textures && samplers == other.samplers &&
+                   texture_layout == other.texture_layout;
+        }
+    };
+
+    struct DescriptorKeyHash {
+        size_t operator()(const DescriptorKey& key) const noexcept;
+    };
+
     struct Pool {
         VkDescriptorPool handle = VK_NULL_HANDLE;
         uint32_t allocated = 0;
@@ -96,6 +119,7 @@ private:
     PFN_vkUpdateDescriptorSets update_sets_ = nullptr;
     PFN_vkCmdBindDescriptorSets bind_sets_ = nullptr;
     std::vector<Pool> pools_;
+    std::unordered_map<DescriptorKey, DescriptorSet, DescriptorKeyHash> descriptor_cache_;
 };
 
 }  // namespace gpu::vulkan

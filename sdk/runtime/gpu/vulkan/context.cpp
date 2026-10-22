@@ -108,6 +108,7 @@ void Context::Reset() {
     destroy_instance_ = nullptr;
     enumerate_physical_devices_ = nullptr;
     get_physical_device_properties_ = nullptr;
+    get_physical_device_properties2_ = nullptr;
     get_physical_device_features2_ = nullptr;
     get_queue_family_properties_ = nullptr;
     enumerate_device_extensions_ = nullptr;
@@ -119,6 +120,12 @@ void Context::Reset() {
     get_surface_capabilities2_enabled_ = false;
     swapchain_maintenance1_enabled_ = false;
     sampler_mirror_clamp_to_edge_enabled_ = false;
+    custom_border_color_extension_available_ = false;
+    custom_border_color_features_available_ = false;
+    custom_border_color_without_format_available_ = false;
+    custom_border_color_enabled_ = false;
+    custom_border_color_without_format_enabled_ = false;
+    max_custom_border_color_samplers_ = 0;
     validation_available_ = false;
     validation_enabled_ = false;
     debug_warning_count_.store(0, std::memory_order_relaxed);
@@ -135,6 +142,27 @@ PFN_vkVoidFunction Context::InstanceProc(const char* name) const {
 PFN_vkVoidFunction Context::DeviceProc(const char* name) const {
     if (device_ == VK_NULL_HANDLE || !get_device_proc_addr_) return nullptr;
     return get_device_proc_addr_(device_, name);
+}
+
+bool Context::CustomBorderColorFormatSupported(VkFormat format) const {
+    if (!custom_border_color_enabled_ || physical_device_ == VK_NULL_HANDLE || !get_format_properties_ ||
+        format == VK_FORMAT_UNDEFINED)
+        return false;
+    VkFormatProperties properties{};
+    get_format_properties_(physical_device_, format, &properties);
+    return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0;
+}
+
+bool Context::CustomBorderColorFormatRequiresTyped(VkFormat format) const {
+    switch (format) {
+        case VK_FORMAT_B4G4R4A4_UNORM_PACK16:
+        case VK_FORMAT_B5G6R5_UNORM_PACK16:
+        case VK_FORMAT_B5G5R5A1_UNORM_PACK16:
+        case VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR:
+            return true;
+        default:
+            return false;
+    }
 }
 
 bool Context::CreateInstance(std::string& error) {
@@ -242,6 +270,8 @@ bool Context::CreateInstance(std::string& error) {
         InstanceFunction<PFN_vkEnumeratePhysicalDevices>(loader_, instance_, "vkEnumeratePhysicalDevices");
     get_physical_device_properties_ =
         InstanceFunction<PFN_vkGetPhysicalDeviceProperties>(loader_, instance_, "vkGetPhysicalDeviceProperties");
+    get_physical_device_properties2_ =
+        InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>(loader_, instance_, "vkGetPhysicalDeviceProperties2");
     get_physical_device_features2_ =
         InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>(loader_, instance_, "vkGetPhysicalDeviceFeatures2");
     get_queue_family_properties_ = InstanceFunction<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
@@ -254,6 +284,7 @@ bool Context::CreateInstance(std::string& error) {
         loader_, instance_, "vkGetPhysicalDeviceImageFormatProperties");
     create_device_ = InstanceFunction<PFN_vkCreateDevice>(loader_, instance_, "vkCreateDevice");
     if (!destroy_instance_ || !enumerate_physical_devices_ || !get_physical_device_properties_ ||
+        !get_physical_device_properties2_ ||
         !get_physical_device_features2_ || !get_queue_family_properties_ ||
         !enumerate_device_extensions_ || !get_format_properties_ || !get_image_format_properties_ || !create_device_) {
         error = "Vulkan instance is missing required device discovery entry points";
@@ -436,10 +467,26 @@ bool Context::SelectPhysicalDevice(std::string& error) {
     VkPhysicalDeviceFeatures2 selected_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan12Features selected_features12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features selected_features13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT selected_custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     selected_features.pNext = &selected_features12;
     selected_features12.pNext = &selected_features13;
+    custom_border_color_extension_available_ =
+        HasDeviceExtension(physical_device_, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    if (custom_border_color_extension_available_) selected_features13.pNext = &selected_custom_border;
     get_physical_device_features2_(physical_device_, &selected_features);
     sampler_mirror_clamp_to_edge_enabled_ = selected_features12.samplerMirrorClampToEdge == VK_TRUE;
+    if (custom_border_color_extension_available_) {
+        VkPhysicalDeviceProperties2 selected_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_properties{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
+        selected_properties.pNext = &custom_properties;
+        get_physical_device_properties2_(physical_device_, &selected_properties);
+        custom_border_color_features_available_ = selected_custom_border.customBorderColors == VK_TRUE;
+        custom_border_color_without_format_available_ =
+            selected_custom_border.customBorderColorWithoutFormat == VK_TRUE;
+        max_custom_border_color_samplers_ = custom_properties.maxCustomBorderColorSamplers;
+    }
     return true;
 }
 
@@ -474,28 +521,54 @@ bool Context::CreateDevice(std::string& error) {
     VkPhysicalDeviceFeatures2 available{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     VkPhysicalDeviceVulkan12Features available12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     VkPhysicalDeviceVulkan13Features available13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT available_custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT available_maintenance{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
+    VkPhysicalDeviceCustomBorderColorFeaturesEXT enabled_custom_border{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT enabled_maintenance{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT};
     bool enable_swapchain_maintenance1 = false;
-    if (enable_win32_wsi_ && surface_maintenance1_enabled_ &&
-        HasDeviceExtension(physical_device_, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+    const bool enable_custom_border_color = custom_border_color_extension_available_ &&
+                                            custom_border_color_features_available_;
+    if (enable_custom_border_color ||
+        (enable_win32_wsi_ && surface_maintenance1_enabled_ &&
+         HasDeviceExtension(physical_device_, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))) {
         available.pNext = &available12;
         available12.pNext = &available13;
+        available13.pNext = nullptr;
+    }
+    if (enable_win32_wsi_ && surface_maintenance1_enabled_ &&
+        HasDeviceExtension(physical_device_, VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
         available13.pNext = &available_maintenance;
+        if (enable_custom_border_color) available_maintenance.pNext = &available_custom_border;
         get_physical_device_features2_(physical_device_, &available);
         enable_swapchain_maintenance1 = available_maintenance.swapchainMaintenance1 == VK_TRUE;
+    } else if (enable_custom_border_color) {
+        available13.pNext = &available_custom_border;
+        get_physical_device_features2_(physical_device_, &available);
     }
     features.pNext = &features12;
     features12.pNext = &features13;
+    enabled_custom_border.customBorderColors = enable_custom_border_color ? VK_TRUE : VK_FALSE;
+    enabled_custom_border.customBorderColorWithoutFormat =
+        enable_custom_border_color && custom_border_color_without_format_available_ ? VK_TRUE : VK_FALSE;
     if (enable_swapchain_maintenance1) {
         enabled_maintenance.swapchainMaintenance1 = VK_TRUE;
-        features13.pNext = &enabled_maintenance;
+        if (enable_custom_border_color) {
+            enabled_maintenance.pNext = &enabled_custom_border;
+            features13.pNext = &enabled_maintenance;
+        } else {
+            features13.pNext = &enabled_maintenance;
+        }
+    } else if (enable_custom_border_color) {
+        features13.pNext = &enabled_custom_border;
     }
 
     std::vector<const char*> extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     if (enable_swapchain_maintenance1) extensions.push_back(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+    if (enable_custom_border_color) extensions.push_back(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     VkDeviceCreateInfo create{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     create.pNext = &features;
     create.queueCreateInfoCount = 1;
@@ -508,6 +581,9 @@ bool Context::CreateDevice(std::string& error) {
         return false;
     }
     swapchain_maintenance1_enabled_ = enable_swapchain_maintenance1;
+    custom_border_color_enabled_ = enable_custom_border_color;
+    custom_border_color_without_format_enabled_ =
+        enable_custom_border_color && custom_border_color_without_format_available_;
 
     if (auto device_destroy = reinterpret_cast<PFN_vkDestroyDevice>(get_device_proc_addr_(device_, "vkDestroyDevice")))
         destroy_device_ = device_destroy;

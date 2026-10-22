@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/state.h"
@@ -55,6 +56,28 @@ struct Assembled {
 
 // the FVF bits translated to the register layout the XDK's declarations use
 void FvfInputs(uint32_t fvf, VertexShader& out);
+
+// The console's 136-slot vertex-program memory and selected declaration/program snapshots.
+// Invalidation drops cache ownership but never invalidates a shared snapshot already queued by a draw.
+class VertexProgramSlots {
+public:
+    static constexpr uint32_t kProgramSlots = 136;
+
+    void Load(uint32_t address, const uint32_t* words, uint32_t instructions);
+    std::shared_ptr<VertexShader> Select(uint32_t address, uint32_t handle, const VertexShader& declaration,
+                                         bool* created = nullptr);
+    void Invalidate(uint32_t handle);
+    void Reset();
+
+private:
+    struct Selected {
+        uint32_t handle = 0;
+        std::shared_ptr<VertexShader> shader;
+    };
+
+    std::array<uint32_t, kProgramSlots * 4> slots_{};
+    std::unordered_multimap<uint64_t, Selected> selected_;
+};
 
 // Immediate-mode vertices are packed into a synthetic declaration before the ordinary assembler sees them.
 std::shared_ptr<VertexShader> MakeImmediateVertexShader(const std::shared_ptr<VertexShader>& source, uint32_t mask);

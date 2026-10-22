@@ -8,7 +8,10 @@
 #include <windows.h>
 #include <xaudio2.h>
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -20,6 +23,32 @@ namespace audio {
 namespace {
 std::mutex g_tap_lock;
 std::function<void(const float*, uint32_t)> g_tap;
+std::once_flag g_mute_log_once;
+
+bool AudioMuteRequested() {
+    const char* value = std::getenv("XBE_AUDIO_MUTE");
+    return value && value[0] && std::strcmp(value, "0") != 0;
+}
+
+bool ApplyOutputMute(IXAudio2MasteringVoice* master, std::string& error) {
+    if (!AudioMuteRequested()) return true;
+    const HRESULT hr = master->SetVolume(0.0f);
+    if (FAILED(hr)) {
+        error = "IXAudio2MasteringVoice::SetVolume(0) failed (" + std::to_string(unsigned(hr)) + ")";
+        return false;
+    }
+    std::call_once(g_mute_log_once, [] {
+        LOGR("audio: developer output mute active via XBE_AUDIO_MUTE; XAudio2 voices and render callbacks remain enabled");
+    });
+    return true;
+}
+
+void DestroyOutput(IXAudio2* xa, IXAudio2MasteringVoice* master, IXAudio2SourceVoice* voice, HRESULT com) {
+    if (voice) voice->DestroyVoice();
+    if (master) master->DestroyVoice();
+    if (xa) xa->Release();
+    if (SUCCEEDED(com)) CoUninitialize();
+}
 }  // namespace
 
 void SetTap(std::function<void(const float*, uint32_t)> tap) {
@@ -43,10 +72,7 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         auto failed = [&](const char* operation, HRESULT hr) {
             if (SUCCEEDED(hr)) return false;
             LOGE("audio: %s failed (%08X), no sound", operation, unsigned(hr));
-            if (voice) voice->DestroyVoice();
-            if (master) master->DestroyVoice();
-            if (xa) xa->Release();
-            if (SUCCEEDED(com)) CoUninitialize();
+            DestroyOutput(xa, master, voice, com);
             return true;
         };
         if (failed("COM initialization", com) ||
@@ -54,7 +80,13 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
             failed("CreateMasteringVoice", xa->CreateMasteringVoice(&master)) ||
             failed("CreateSourceVoice", xa->CreateSourceVoice(&voice, &wf)))
             return;
-        voice->Start();
+        std::string mute_error;
+        if (!ApplyOutputMute(master, mute_error)) {
+            LOGE("audio: %s, no sound", mute_error.c_str());
+            DestroyOutput(xa, master, voice, com);
+            return;
+        }
+        if (failed("StartSourceVoice", voice->Start())) return;
         constexpr uint32_t kFrames = kRate / 100, kSlots = 4;
         std::vector<float> bufs(kSlots * kFrames * 2);
         for (uint32_t n = 0;;) {

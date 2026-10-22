@@ -13,6 +13,13 @@ constexpr VkShaderStageFlags kGraphicsStages = VK_SHADER_STAGE_VERTEX_BIT | VK_S
                                                VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT |
                                                VK_SHADER_STAGE_GEOMETRY_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 constexpr size_t kMaxPoolCount = 64;
+constexpr size_t kMaxDescriptorCacheEntries = 4096;
+
+template <typename T>
+void HashCombine(size_t& seed, T value) {
+    const size_t hash = std::hash<T>{}(value);
+    seed ^= hash + size_t(0x9e3779b9) + (seed << 6) + (seed >> 2);
+}
 
 bool Result(VkResult result, const char* operation, std::string& error) {
     if (result == VK_SUCCESS) return true;
@@ -21,6 +28,17 @@ bool Result(VkResult result, const char* operation, std::string& error) {
 }
 
 }  // namespace
+
+size_t DescriptorArena::DescriptorKeyHash::operator()(const DescriptorKey& key) const noexcept {
+    size_t seed = 0;
+    HashCombine(seed, key.constant_buffer);
+    HashCombine(seed, key.constant_buffer_size);
+    HashCombine(seed, key.constant_range);
+    for (VkImageView view : key.textures) HashCombine(seed, view);
+    for (VkSampler sampler : key.samplers) HashCombine(seed, sampler);
+    HashCombine(seed, key.texture_layout);
+    return seed;
+}
 
 DescriptorArena::~DescriptorArena() { Reset(); }
 
@@ -92,6 +110,7 @@ void DescriptorArena::Reset() {
         if (layout_ && destroy_layout_) destroy_layout_(device_, layout_, nullptr);
     }
     pools_.clear();
+    descriptor_cache_.clear();
     device_ = VK_NULL_HANDLE;
     layout_ = VK_NULL_HANDLE;
     sets_per_pool_ = 0;
@@ -165,6 +184,15 @@ bool DescriptorArena::Allocate(const DescriptorResources& resources, DescriptorS
         error = "Vulkan descriptor arena cannot allocate while its owner batch is pending";
         return false;
     }
+    const DescriptorKey key{resources.constant_buffer, resources.constant_buffer_size, resources.constant_range,
+                            resources.textures, resources.samplers, resources.texture_layout};
+    if (const auto cached = descriptor_cache_.find(key); cached != descriptor_cache_.end()) {
+        if (IsCurrent(cached->second)) {
+            set = cached->second;
+            return true;
+        }
+        descriptor_cache_.erase(cached);
+    }
     VkDescriptorSet descriptor = VK_NULL_HANDLE;
     for (;;) {
         if (pool_at_ == pools_.size() && !CreatePool(error)) return false;
@@ -211,6 +239,7 @@ bool DescriptorArena::Allocate(const DescriptorResources& resources, DescriptorS
     }
     update_sets_(device_, write_at, writes.data(), 0, nullptr);
     set = {descriptor, generation_, this, resources.constant_buffer_size, resources.constant_range};
+    if (descriptor_cache_.size() < kMaxDescriptorCacheEntries) descriptor_cache_.emplace(key, set);
     return true;
 }
 
@@ -266,6 +295,7 @@ bool DescriptorArena::MarkInFlight(const CommandBatch& batch, std::string& error
 
 bool DescriptorArena::ResetPools(std::string& error) {
     if (++generation_ == 0) generation_ = 1;
+    descriptor_cache_.clear();
     for (Pool& pool : pools_) {
         if (!Result(reset_pool_(device_, pool.handle, 0), "vkResetDescriptorPool", error)) {
             pool_at_ = pools_.size();

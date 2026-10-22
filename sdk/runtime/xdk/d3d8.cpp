@@ -81,6 +81,7 @@ std::recursive_mutex g_lock;
 
 std::unordered_map<uint32_t, std::shared_ptr<gpu::VertexShader>> g_vs;
 std::unordered_map<uint32_t, std::shared_ptr<gpu::PixelShader>> g_ps;
+gpu::VertexProgramSlots g_vs_slots;
 std::array<uint32_t, 3> g_buffers{};  // front, back surfaces
 uint32_t g_buffer_count = 2;
 uint32_t g_depth = 0;
@@ -305,6 +306,7 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         g_backend = std::move(backend);
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
+    g_vs_slots.Reset();
     g_state = gpu::State{};
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
     SetDev(kDevRenderTarget, g_buffers[1]);
@@ -830,6 +832,7 @@ HLE_STDCALL(D3DDevice_CreateVertexShader, 4) {
 
 HLE_STDCALL(D3DDevice_DeleteVertexShader, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_vs_slots.Invalidate(a[0]);
     auto it = g_vs.find(a[0]);
     if (it != g_vs.end()) {
         mem::FreeSystem(a[0] & ~1u);
@@ -937,16 +940,6 @@ HLE_FASTCALL(D3DDevice_SetVertexShaderConstantNotInlineFast, 1) {
 // Vertex program memory: the console runs vertex programs from 136 instruction slots. LoadVertexShader and
 // LoadVertexShaderProgram fill slots, SelectVertexShader runs from a slot to the first final instruction with a
 // shader's declaration (RenderWare's skinning and lighting load their programs at slot 12 this way).
-namespace {
-constexpr uint32_t kProgramSlots = 136;
-std::array<uint32_t, kProgramSlots * 4> g_vs_slots{};
-std::unordered_map<uint64_t, std::shared_ptr<gpu::VertexShader>> g_vs_selected;  // by declaration and program
-
-void LoadSlots(uint32_t address, const uint32_t* words, uint32_t instructions) {
-    for (uint32_t i = 0; i < instructions && address + i < kProgramSlots; i++)
-        std::memcpy(&g_vs_slots[(address + i) * 4], words + i * 4, 16);
-}
-}  // namespace
 
 HLE_STDCALL(D3DDevice_LoadVertexShader, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -956,7 +949,7 @@ HLE_STDCALL(D3DDevice_LoadVertexShader, 2) {
         return 0;
     }
     const auto& prog = it->second->program;
-    LoadSlots(a[1], prog.data(), uint32_t(prog.size() / 4));
+    g_vs_slots.Load(a[1], prog.data(), uint32_t(prog.size() / 4));
     return 0;
 }
 
@@ -966,32 +959,23 @@ HLE_STDCALL(D3DDevice_LoadVertexShaderProgram, 2) {
     uint32_t func = a[0], n = R32(func) >> 16;
     std::vector<uint32_t> words(n * 4);
     for (uint32_t i = 0; i < n * 4; i++) words[i] = R32(func + 4 + i * 4);
-    LoadSlots(a[1], words.data(), n);
+    g_vs_slots.Load(a[1], words.data(), n);
     return 0;
 }
 
 HLE_STDCALL(D3DDevice_SelectVertexShader, 2) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    uint32_t h = a[0], address = std::min(a[1], kProgramSlots - 1);
+    uint32_t h = a[0];
     auto it = g_vs.find(h);
     if (!(h & 1) || it == g_vs.end()) {
         LOG_FIRST(8, "d3d: SelectVertexShader with handle %08X, no declaration", h);
         return 0;
     }
-    // the program runs to its final instruction (bit 0 of the last word)
-    uint32_t end = address;
-    while (end < kProgramSlots && !(g_vs_slots[end * 4 + 3] & 1)) end++;
-    end = std::min(end + 1, kProgramSlots);
-    uint64_t key = 0xCBF29CE484222325ull ^ h;
-    for (uint32_t i = address * 4; i < end * 4; i++) key = (key ^ g_vs_slots[i]) * 0x100000001B3ull;
-    auto& vs = g_vs_selected[key];
-    if (!vs) {
-        vs = std::make_shared<gpu::VertexShader>(*it->second);
-        vs->program.assign(g_vs_slots.begin() + address * 4, g_vs_slots.begin() + end * 4);
-        vs->program_type = 0x2078;
-        vs->hash = 0;
-        LOG_FIRST(64, "d3d: selected vertex program at %u, %u instructions, declaration %08X", address, end - address, h);
-    }
+    bool created = false;
+    auto vs = g_vs_slots.Select(a[1], h, *it->second, &created);
+    if (created)
+        LOG_FIRST(64, "d3d: selected vertex program at %u, %zu instructions, declaration %08X",
+                  std::min(a[1], gpu::VertexProgramSlots::kProgramSlots - 1), vs->program.size() / 4, h);
     g_state.vs_handle = h;
     g_state.vs = vs;
     for (auto& [reg, v] : vs->constants)

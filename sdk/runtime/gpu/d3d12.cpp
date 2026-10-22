@@ -1242,6 +1242,8 @@ private:
     void GpuMark(const char* name);
     void ResolveGpuMarks();
     void ReadGpuMarks();
+    diag::PerfTrace perf_trace_{"d3d12"};
+    uint64_t perf_gpu_trace_index_ = 0;
     // the television around the 4:3 screens (g_tv_frame)
     ComPtr<ID3D12Resource> tv_frame_;
     DXGI_FORMAT tv_fmt_ = DXGI_FORMAT_UNKNOWN;
@@ -7736,7 +7738,10 @@ void D3D12Backend::ReadGpuMarks() {
     }
     D3D12_RANGE none{0, 0};
     marks_rb_->Unmap(0, &none);
-    if (gpu::g_frame_stats.load() == 1 && g_gpu_frames.size() < 200000) g_gpu_frames.push_back(std::move(f));
+    if (gpu::g_frame_stats.load() == 1) {
+        if (perf_trace_.Enabled()) perf_trace_.Gpu(perf_gpu_trace_index_++, f.total);
+        if (g_gpu_frames.size() < 200000) g_gpu_frames.push_back(std::move(f));
+    }
 }
 
 void D3D12Backend::ReadShadowTimes() {
@@ -9756,7 +9761,24 @@ void D3D12Backend::CountFps() {
                              uint32_t(g_perf.psos - before.psos), uint32_t(g_perf.texups - before.texups),
                              uint32_t(g_perf.newtex - before.newtex), uint32_t(g_perf.draws - before.draws),
                              std::chrono::duration<double>(now - start).count(), now});
+            if (perf_trace_.Enabled()) {
+                diag::PerfFrameSample sample;
+                sample.index = stats.size() - 1;
+                sample.renderer_sample_ms = ms;
+                sample.wait_ms = stats.back().wait;
+                sample.compile_ms = stats.back().compile;
+                sample.upload_ms = stats.back().texup;
+                sample.sync_ms = stats.back().sync;
+                sample.present_ms = stats.back().present;
+                sample.draws = uint64_t(stats.back().draws);
+                sample.shader_events = uint64_t(stats.back().shaders);
+                sample.pipeline_events = uint64_t(stats.back().psos);
+                sample.texture_uploads = uint64_t(stats.back().texups);
+                sample.auxiliary_events = uint64_t(stats.back().newtex);
+                perf_trace_.Frame(sample);
+            }
         } else if (mode == 2) {
+            perf_trace_.Stop();
             gpu::g_frame_stats = 0;
             recording = false;
             {
@@ -9941,6 +9963,7 @@ void LogPerf(Perf& rec_start_perf_) {
 }
 
 void D3D12Backend::Present(const Surface& front) {
+    perf_trace_.Present(gpu::g_frame_stats.load() == 1);
     MsaaResolve();
     msaa_done_ = false;
     sky_phase_ = true, sky_layer_ = 0;

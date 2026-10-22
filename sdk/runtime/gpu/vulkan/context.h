@@ -31,6 +31,13 @@ public:
     const VkPhysicalDeviceProperties& Properties() const { return properties_; }
     bool SwapchainMaintenance1Enabled() const { return swapchain_maintenance1_enabled_; }
     bool SamplerMirrorClampToEdgeEnabled() const { return sampler_mirror_clamp_to_edge_enabled_; }
+    bool CustomBorderColorExtensionAvailable() const { return custom_border_color_extension_available_; }
+    bool CustomBorderColorFeatureAvailable() const { return custom_border_color_features_available_; }
+    bool CustomBorderColorEnabled() const { return custom_border_color_enabled_; }
+    bool CustomBorderColorWithoutFormatEnabled() const { return custom_border_color_without_format_enabled_; }
+    uint32_t MaxCustomBorderColorSamplers() const { return max_custom_border_color_samplers_; }
+    bool CustomBorderColorFormatRequiresTyped(VkFormat format) const;
+    bool CustomBorderColorFormatSupported(VkFormat format) const;
     bool ValidationAvailable() const { return validation_available_; }
     bool ValidationEnabled() const { return validation_enabled_; }
     uint32_t DebugWarningCount() const { return debug_warning_count_.load(std::memory_order_relaxed); }
@@ -66,6 +73,7 @@ private:
     PFN_vkDestroyInstance destroy_instance_ = nullptr;
     PFN_vkEnumeratePhysicalDevices enumerate_physical_devices_ = nullptr;
     PFN_vkGetPhysicalDeviceProperties get_physical_device_properties_ = nullptr;
+    PFN_vkGetPhysicalDeviceProperties2 get_physical_device_properties2_ = nullptr;
     PFN_vkGetPhysicalDeviceFeatures2 get_physical_device_features2_ = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties get_queue_family_properties_ = nullptr;
     PFN_vkEnumerateDeviceExtensionProperties enumerate_device_extensions_ = nullptr;
@@ -83,6 +91,12 @@ private:
     bool get_surface_capabilities2_enabled_ = false;
     bool swapchain_maintenance1_enabled_ = false;
     bool sampler_mirror_clamp_to_edge_enabled_ = false;
+    bool custom_border_color_extension_available_ = false;
+    bool custom_border_color_features_available_ = false;
+    bool custom_border_color_without_format_available_ = false;
+    bool custom_border_color_enabled_ = false;
+    bool custom_border_color_without_format_enabled_ = false;
+    uint32_t max_custom_border_color_samplers_ = 0;
     bool validation_available_ = false;
     bool validation_enabled_ = false;
     std::atomic<uint32_t> debug_warning_count_{0};

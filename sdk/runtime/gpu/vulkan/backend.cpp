@@ -35,8 +35,6 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D24_UNORM_S8_UINT;
 constexpr VkDeviceSize kConstantAlignment = 256;
 constexpr VkDeviceSize kConstantRange = 16ull * 1024;
 constexpr float kDepth24Max = 16777215.0f;
-constexpr uint32_t kFmtD16 = 0x2C;
-constexpr uint32_t kFmtLinD16 = 0x30;
 
 VkFormat UiFormat(DXGI_FORMAT format) {
     switch (format) {
@@ -72,6 +70,11 @@ bool Result(VkResult result, const char* operation, std::string& error) {
     return false;
 }
 
+uint64_t ElapsedNanoseconds(std::chrono::steady_clock::time_point start) {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - start).count());
+}
+
 float Bits(uint32_t value) {
     float result;
     std::memcpy(&result, &value, sizeof(result));
@@ -92,17 +95,6 @@ uint32_t SimpleState(const State& state, uint32_t method) {
 VkImageAspectFlags ColorAspect() { return VK_IMAGE_ASPECT_COLOR_BIT; }
 
 VkImageAspectFlags DepthAspect() { return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT; }
-
-uint8_t ShadowDepthKind(uint32_t format) {
-    return format == kFmtD16 || format == kFmtLinD16 ? 2 : 1;
-}
-
-VkCompareOp ShadowCompareOp(uint32_t value) {
-    // The console compares texel OP reference; Vulkan comparison samplers compare reference OP texel.
-    static constexpr uint8_t swap[8] = {0, 4, 2, 6, 1, 5, 3, 7};
-    const uint32_t cmp = value >= 0x200 && value <= 0x207 ? value - 0x200 : 7;
-    return static_cast<VkCompareOp>(swap[cmp]);
-}
 
 VkDeviceSize Align(VkDeviceSize value, VkDeviceSize alignment) {
     return (value + alignment - 1) / alignment * alignment;
@@ -407,10 +399,12 @@ VulkanBackend::~VulkanBackend() {
     dummy_.reset();
     samplers_.clear();
     stage_samplers_.clear();
+    custom_border_sampler_count_ = 0;
     descriptors_.Reset();
     batch_.Reset();
     swapchain_.Reset();
     surface_.Reset();
+    ClearDrawDispatch();
     context_.Reset();
 }
 
@@ -505,11 +499,16 @@ void VulkanBackend::ReportCapabilities() {
     capability_reported_ = true;
     capability_settings_signature_ = signature;
     const uint32_t api = context_.Properties().apiVersion;
-    LOGR("vulkan: capability report tier=original-core original_control=available remaster_pass_graph=unavailable settings_signature=%016llX api=%u.%u.%u validation=%s mirror_clamp=%s swapchain_maintenance1=%s",
+    LOGR("vulkan: capability report tier=original-core original_control=available remaster_pass_graph=unavailable settings_signature=%016llX api=%u.%u.%u validation=%s mirror_clamp=%s swapchain_maintenance1=%s custom_border_color_extension=%s custom_border_color_feature=%s custom_border_color=%s custom_border_color_without_format=%s max_custom_border_color_samplers=%u",
          static_cast<unsigned long long>(signature), VK_VERSION_MAJOR(api), VK_VERSION_MINOR(api), VK_VERSION_PATCH(api),
          context_.ValidationEnabled() ? "enabled" : context_.ValidationAvailable() ? "available-not-enabled" : "unavailable",
          context_.SamplerMirrorClampToEdgeEnabled() ? "enabled" : "unavailable",
-         context_.SwapchainMaintenance1Enabled() ? "enabled" : "unavailable");
+         context_.SwapchainMaintenance1Enabled() ? "enabled" : "unavailable",
+         context_.CustomBorderColorExtensionAvailable() ? "available" : "unavailable",
+         context_.CustomBorderColorFeatureAvailable() ? "available" : "unavailable",
+         context_.CustomBorderColorEnabled() ? "enabled" : "unavailable",
+         context_.CustomBorderColorWithoutFormatEnabled() ? "enabled" : "unavailable",
+         context_.MaxCustomBorderColorSamplers());
     if (!unsupported.empty())
         LOGW("vulkan: requested settings are not executed by the current Vulkan enhancement pass graph (values preserved): %s",
              unsupported.c_str());
@@ -517,10 +516,15 @@ void VulkanBackend::ReportCapabilities() {
 
 bool VulkanBackend::InitPerfQueries(uint32_t forced_interval) {
     const char* value = std::getenv("XBE_VK_PERF");
-    if (!forced_interval && (!value || !value[0] || value[0] == '0')) return true;
+    const bool trace_requested = diag::PerfTrace::Requested();
+    const char* detail = std::getenv("XBE_VK_PERF_DETAIL");
+    perf_detail_enabled_ = trace_requested && detail && std::strcmp(detail, "1") == 0;
+    if (!forced_interval && (!value || !value[0] || value[0] == '0') && !trace_requested) return true;
     perf_enabled_ = true;
     perf_interval_ = forced_interval ? forced_interval :
-                                      std::max(1u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)));
+                                      value && value[0] && value[0] != '0'
+                                          ? std::max(1u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
+                                          : 600;
     if (!context_.Properties().limits.timestampPeriod) {
         LOGW("vulkan: XBE_VK_PERF enabled but timestamp queries are unavailable");
         return true;
@@ -538,9 +542,21 @@ bool VulkanBackend::InitPerfQueries(uint32_t forced_interval) {
         LOGW("vulkan: XBE_VK_PERF GPU timestamps disabled: %s", error.c_str());
         perf_query_pool_ = VK_NULL_HANDLE;
     } else {
-        LOGR("vulkan: perf diagnostics enabled interval=%u gpu_timestamps=on", perf_interval_);
+        LOGR("vulkan: perf diagnostics enabled interval=%u gpu_timestamps=on detail=%s", perf_interval_,
+             perf_detail_enabled_ ? "trace-opt-in" : "off");
     }
     return true;
+}
+
+bool VulkanBackend::LoadDrawDispatch() {
+    std::string error;
+    if (!draw_dispatch_.Load([this](const char* name) { return context_.DeviceProc(name); }, error))
+        return Fail("draw dispatch initialization", error);
+    return true;
+}
+
+void VulkanBackend::ClearDrawDispatch() {
+    draw_dispatch_.Clear();
 }
 
 void VulkanBackend::ResetPerfQueries() {
@@ -550,6 +566,7 @@ void VulkanBackend::ResetPerfQueries() {
     }
     perf_query_pool_ = VK_NULL_HANDLE;
     perf_frame_active_ = false;
+    perf_detail_frame_active_ = false;
     perf_frame_ended_ = false;
     perf_query_pending_ = false;
 }
@@ -558,13 +575,25 @@ void VulkanBackend::BeginPerfFrame() {
     if (!perf_enabled_) return;
     perf_current_draws_ = perf_current_pipeline_misses_ = perf_current_shader_modules_ = 0;
     perf_current_source_hits_ = perf_current_source_misses_ = 0;
-    perf_current_texture_uploads_ = perf_current_descriptor_sets_ = 0;
+    perf_current_texture_uploads_ = perf_current_descriptor_requests_ = 0;
     perf_current_record_ns_ = perf_current_wait_ns_ = 0;
+    perf_current_detail_vertex_assembly_ns_ = 0;
+    perf_current_detail_texture_target_sampler_ns_ = 0;
+    perf_current_detail_pipeline_source_ns_ = 0;
+    perf_current_detail_constant_vertex_index_upload_ns_ = 0;
+    perf_current_detail_descriptor_lookup_allocation_ns_ = 0;
+    perf_current_detail_command_recording_ns_ = 0;
+    perf_current_detail_swapchain_render_wait_ns_ = 0;
+    perf_current_detail_batch_completion_wait_ns_ = 0;
+    perf_current_detail_late_publish_ns_ = 0;
+    perf_current_detail_descriptor_retire_ns_ = 0;
+    perf_current_detail_resource_retire_ns_ = 0;
     perf_current_upload_allocations_ = perf_current_upload_bytes_ = perf_current_upload_block_grows_ = 0;
     perf_current_gpu_valid_ = false;
     perf_current_gpu_ms_ = 0.0;
     perf_frame_start_ = std::chrono::steady_clock::now();
     perf_frame_active_ = true;
+    perf_detail_frame_active_ = perf_detail_enabled_ && g_frame_stats.load(std::memory_order_relaxed) == 1;
     perf_frame_ended_ = false;
     perf_query_pending_ = false;
     if (!perf_query_pool_) return;
@@ -596,12 +625,12 @@ void VulkanBackend::ReportPerfWindow() {
     const double frames = double(perf_window_frames_);
     const auto ms = [](uint64_t ns) { return double(ns) / 1000000.0; };
     if (perf_window_gpu_samples_) {
-        LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptors=%llu "
+        LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptor_requests=%llu "
              "sources_hit=%llu sources_miss=%llu upload_allocs=%llu upload_kib=%.1f block_grows=%llu rewinds=%llu peak_blocks=%zu "
              "record_ms=%.2f wait_ms=%.2f gpu_ms=%.2f",
              (unsigned long long)perf_window_frames_, (unsigned long long)perf_window_draws_,
              (unsigned long long)perf_window_pipeline_misses_, (unsigned long long)perf_window_shader_modules_,
-             (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_sets_,
+             (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_requests_,
              (unsigned long long)perf_window_source_hits_, (unsigned long long)perf_window_source_misses_,
              (unsigned long long)perf_window_upload_allocations_, double(perf_window_upload_bytes_) / 1024.0,
              (unsigned long long)perf_window_upload_block_grows_, (unsigned long long)perf_window_upload_rewinds_,
@@ -609,12 +638,12 @@ void VulkanBackend::ReportPerfWindow() {
              ms(perf_window_record_ns_) / frames, ms(perf_window_wait_ns_) / frames,
              perf_window_gpu_ms_ / double(perf_window_gpu_samples_));
     } else {
-        LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptors=%llu "
+        LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptor_requests=%llu "
              "sources_hit=%llu sources_miss=%llu upload_allocs=%llu upload_kib=%.1f block_grows=%llu rewinds=%llu peak_blocks=%zu "
              "record_ms=%.2f wait_ms=%.2f gpu_ms=unavailable",
              (unsigned long long)perf_window_frames_, (unsigned long long)perf_window_draws_,
              (unsigned long long)perf_window_pipeline_misses_, (unsigned long long)perf_window_shader_modules_,
-             (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_sets_,
+             (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_requests_,
              (unsigned long long)perf_window_source_hits_, (unsigned long long)perf_window_source_misses_,
              (unsigned long long)perf_window_upload_allocations_, double(perf_window_upload_bytes_) / 1024.0,
              (unsigned long long)perf_window_upload_block_grows_, (unsigned long long)perf_window_upload_rewinds_,
@@ -623,7 +652,7 @@ void VulkanBackend::ReportPerfWindow() {
     }
     perf_window_frames_ = perf_window_draws_ = perf_window_pipeline_misses_ = perf_window_shader_modules_ = 0;
     perf_window_source_hits_ = perf_window_source_misses_ = 0;
-    perf_window_texture_uploads_ = perf_window_descriptor_sets_ = 0;
+    perf_window_texture_uploads_ = perf_window_descriptor_requests_ = 0;
     perf_window_record_ns_ = perf_window_wait_ns_ = 0;
     perf_window_upload_allocations_ = perf_window_upload_bytes_ = perf_window_upload_block_grows_ = 0;
     perf_window_upload_rewinds_ = 0;
@@ -634,7 +663,9 @@ void VulkanBackend::ReportPerfWindow() {
 
 void VulkanBackend::FinishPerfFrame(uint64_t wait_ns) {
     if (!perf_enabled_ || !perf_frame_active_ || !perf_frame_ended_) return;
+    if (g_frame_stats.load() == 2) perf_trace_.Stop();
     perf_current_wait_ns_ = wait_ns;
+    perf_current_frame_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_frame_start_).count();
     if (perf_query_pending_) {
         uint64_t timestamps[2] = {};
         auto get = DeviceProc<PFN_vkGetQueryPoolResults>(context_, "vkGetQueryPoolResults");
@@ -654,7 +685,7 @@ void VulkanBackend::FinishPerfFrame(uint64_t wait_ns) {
     perf_window_source_hits_ += perf_current_source_hits_;
     perf_window_source_misses_ += perf_current_source_misses_;
     perf_window_texture_uploads_ += perf_current_texture_uploads_;
-    perf_window_descriptor_sets_ += perf_current_descriptor_sets_;
+    perf_window_descriptor_requests_ += perf_current_descriptor_requests_;
     perf_window_record_ns_ += perf_current_record_ns_;
     perf_window_wait_ns_ += perf_current_wait_ns_;
     perf_window_upload_allocations_ += perf_current_upload_allocations_;
@@ -665,8 +696,57 @@ void VulkanBackend::FinishPerfFrame(uint64_t wait_ns) {
         ++perf_window_gpu_samples_;
         perf_window_gpu_ms_ += perf_current_gpu_ms_;
     }
+    if (g_frame_stats.load() == 1 && perf_current_frame_ms_ > 0.0 && perf_trace_.Enabled()) {
+        diag::PerfFrameSample sample;
+        sample.index = perf_trace_frame_index_++;
+        sample.renderer_sample_ms = perf_current_frame_ms_;
+        sample.record_ms = double(perf_current_record_ns_) / 1000000.0;
+        sample.wait_ms = double(perf_current_wait_ns_) / 1000000.0;
+        if (perf_current_gpu_valid_) sample.gpu_ms = perf_current_gpu_ms_;
+        sample.draws = perf_current_draws_;
+        sample.shader_events = perf_current_shader_modules_;
+        sample.pipeline_events = perf_current_pipeline_misses_;
+        sample.texture_uploads = perf_current_texture_uploads_;
+        sample.auxiliary_events = perf_current_descriptor_requests_;
+        sample.source_hits = perf_current_source_hits_;
+        sample.source_misses = perf_current_source_misses_;
+        if (perf_detail_frame_active_) {
+            const auto detail_ms = [](uint64_t ns) { return double(ns) / 1000000.0; };
+            const uint64_t phase_sum_ns = perf_current_detail_vertex_assembly_ns_ +
+                                          perf_current_detail_texture_target_sampler_ns_ +
+                                          perf_current_detail_pipeline_source_ns_ +
+                                          perf_current_detail_constant_vertex_index_upload_ns_ +
+                                          perf_current_detail_descriptor_lookup_allocation_ns_ +
+                                          perf_current_detail_command_recording_ns_;
+            sample.detail_vertex_assembly_ms = detail_ms(perf_current_detail_vertex_assembly_ns_);
+            sample.detail_texture_target_sampler_ms = detail_ms(perf_current_detail_texture_target_sampler_ns_);
+            sample.detail_pipeline_source_ms = detail_ms(perf_current_detail_pipeline_source_ns_);
+            sample.detail_constant_vertex_index_upload_ms =
+                detail_ms(perf_current_detail_constant_vertex_index_upload_ns_);
+            sample.detail_descriptor_lookup_allocation_ms =
+                detail_ms(perf_current_detail_descriptor_lookup_allocation_ns_);
+            sample.detail_command_recording_ms = detail_ms(perf_current_detail_command_recording_ns_);
+            sample.detail_phase_sum_ms = detail_ms(phase_sum_ns);
+            sample.detail_record_residual_ms = (double(perf_current_record_ns_) - double(phase_sum_ns)) / 1000000.0;
+            const uint64_t wait_phase_sum_ns = perf_current_detail_swapchain_render_wait_ns_ +
+                                               perf_current_detail_batch_completion_wait_ns_ +
+                                               perf_current_detail_late_publish_ns_ +
+                                               perf_current_detail_descriptor_retire_ns_ +
+                                               perf_current_detail_resource_retire_ns_;
+            sample.detail_swapchain_render_wait_ms = detail_ms(perf_current_detail_swapchain_render_wait_ns_);
+            sample.detail_batch_completion_wait_ms = detail_ms(perf_current_detail_batch_completion_wait_ns_);
+            sample.detail_late_publish_ms = detail_ms(perf_current_detail_late_publish_ns_);
+            sample.detail_descriptor_retire_ms = detail_ms(perf_current_detail_descriptor_retire_ns_);
+            sample.detail_resource_retire_ms = detail_ms(perf_current_detail_resource_retire_ns_);
+            sample.detail_wait_phase_sum_ms = detail_ms(wait_phase_sum_ns);
+            sample.detail_wait_residual_ms =
+                (double(perf_current_wait_ns_) - double(wait_phase_sum_ns)) / 1000000.0;
+        }
+        perf_trace_.Frame(sample);
+    }
     if (perf_window_frames_ >= perf_interval_) ReportPerfWindow();
     perf_frame_active_ = false;
+    perf_detail_frame_active_ = false;
     perf_frame_ended_ = false;
     perf_query_pending_ = false;
 }
@@ -677,6 +757,7 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     render_scale_ = std::max(app::RenderScale(height), 1.0f);
     std::string error;
     if (!context_.Init(error, true)) return Fail("context initialization", error);
+    if (!LoadDrawDispatch()) return false;
     if (!uploads_.Init(context_, 4u * 1024u * 1024u, error)) return Fail("upload allocator initialization", error);
     if (!surface_.Init(context_, static_cast<HWND>(app::Window()), error)) return Fail("Win32 surface initialization", error);
     if (!surface_.SupportsGraphicsQueue(context_, error)) return Fail("Win32 queue support", error);
@@ -709,18 +790,37 @@ bool VulkanBackend::BeginFrame() {
     if (recording_) return true;
     if (!perf_enabled_ && g_log_draws.load(std::memory_order_relaxed) >= 3) InitPerfQueries(3);
     const auto wait_start = std::chrono::steady_clock::now();
+    const bool capture_wait_detail = perf_frame_active_ && perf_detail_frame_active_;
     std::string error;
     if (batch_.Pending()) {
-        if (swapchain_.Ready() && !swapchain_.WaitForRendering(UINT64_MAX, error))
-            return Fail("presentation completion", error);
+        if (swapchain_.Ready()) {
+            const auto phase_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                         : std::chrono::steady_clock::time_point{};
+            if (!swapchain_.WaitForRendering(UINT64_MAX, error)) return Fail("presentation completion", error);
+            if (capture_wait_detail) perf_current_detail_swapchain_render_wait_ns_ += ElapsedNanoseconds(phase_start);
+        }
+        const auto batch_wait_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
         if (!batch_.Wait(UINT64_MAX, error)) return Fail("frame completion", error);
+        if (capture_wait_detail) perf_current_detail_batch_completion_wait_ns_ += ElapsedNanoseconds(batch_wait_start);
+        const auto late_publish_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                            : std::chrono::steady_clock::time_point{};
         PublishLateCompletion();
-        if (descriptors_used_ && !descriptors_.ResetAfterCompletion(batch_, 0, error))
-            return Fail("descriptor retirement", error);
+        if (capture_wait_detail) perf_current_detail_late_publish_ns_ += ElapsedNanoseconds(late_publish_start);
+        if (descriptors_used_) {
+            const auto descriptor_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                                     : std::chrono::steady_clock::time_point{};
+            if (!descriptors_.ResetAfterCompletion(batch_, 0, error)) return Fail("descriptor retirement", error);
+            if (capture_wait_detail)
+                perf_current_detail_descriptor_retire_ns_ += ElapsedNanoseconds(descriptor_retire_start);
+        }
         descriptors_used_ = false;
+        const auto resource_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                               : std::chrono::steady_clock::time_point{};
         frame_buffers_.clear();
         RetireUploads();
         frame_images_.clear();
+        if (capture_wait_detail) perf_current_detail_resource_retire_ns_ += ElapsedNanoseconds(resource_retire_start);
     }
     const uint64_t wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - wait_start).count());
@@ -739,6 +839,7 @@ bool VulkanBackend::CompleteFrame() {
     EndRendering();
     EndPerfFrame();
     const auto wait_start = std::chrono::steady_clock::now();
+    const bool capture_wait_detail = perf_frame_active_ && perf_detail_frame_active_;
     std::string error;
     if (recording_) {
         if (!batch_.Submit(error)) {
@@ -752,13 +853,29 @@ bool VulkanBackend::CompleteFrame() {
         if (descriptors_used_ && !descriptors_.MarkInFlight(batch_, error)) return Fail("ordinary descriptor ownership", error);
     }
     if (batch_.Pending()) {
+        const auto batch_wait_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                          : std::chrono::steady_clock::time_point{};
         if (!batch_.Wait(UINT64_MAX, error)) return Fail("ordinary command completion", error);
+        if (capture_wait_detail) perf_current_detail_batch_completion_wait_ns_ += ElapsedNanoseconds(batch_wait_start);
+        const auto late_publish_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                            : std::chrono::steady_clock::time_point{};
         PublishLateCompletion();
-        if (descriptors_used_ && !descriptors_.ResetAfterCompletion(batch_, 0, error)) return Fail("ordinary descriptor retirement", error);
+        if (capture_wait_detail) perf_current_detail_late_publish_ns_ += ElapsedNanoseconds(late_publish_start);
+        if (descriptors_used_) {
+            const auto descriptor_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                                     : std::chrono::steady_clock::time_point{};
+            if (!descriptors_.ResetAfterCompletion(batch_, 0, error))
+                return Fail("ordinary descriptor retirement", error);
+            if (capture_wait_detail)
+                perf_current_detail_descriptor_retire_ns_ += ElapsedNanoseconds(descriptor_retire_start);
+        }
         descriptors_used_ = false;
+        const auto resource_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                               : std::chrono::steady_clock::time_point{};
         frame_buffers_.clear();
         RetireUploads();
         frame_images_.clear();
+        if (capture_wait_detail) perf_current_detail_resource_retire_ns_ += ElapsedNanoseconds(resource_retire_start);
     }
     const uint64_t wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - wait_start).count());
@@ -1313,7 +1430,7 @@ void VulkanBackend::Transition(vulkan::Image& image, VkImageLayout& current, VkI
     // Image layout barriers are not legal inside an active dynamic-rendering instance. Uploads and other
     // asynchronous image users can arrive after a draw, so the transition owns closing that rendering scope.
     EndRendering();
-    auto barrier = DeviceProc<PFN_vkCmdPipelineBarrier>(context_, "vkCmdPipelineBarrier");
+    auto barrier = draw_dispatch_.pipeline_barrier;
     if (!barrier) {
         Fail("image transition", "vkCmdPipelineBarrier unavailable");
         return;
@@ -1338,7 +1455,7 @@ void VulkanBackend::Transition(VkImage image, VkImageAspectFlags aspect, VkImage
                                VkImageLayout layout) {
     if (current == layout) return;
     EndRendering();
-    auto barrier = DeviceProc<PFN_vkCmdPipelineBarrier>(context_, "vkCmdPipelineBarrier");
+    auto barrier = draw_dispatch_.pipeline_barrier;
     if (!barrier) {
         Fail("external image transition", "vkCmdPipelineBarrier unavailable");
         return;
@@ -1363,7 +1480,7 @@ void VulkanBackend::Transition(Target& target, VkImageLayout layout) {
     Transition(*target.image, target.layout, layout, target.depth ? DepthAspect() : ColorAspect());
 }
 
-VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow) {
+VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow, VkFormat sampled_format) {
     const auto& tss = state.tss[size_t(stage)];
     SamplerKey key;
     key.mag = tss[kTssMagFilter];
@@ -1377,7 +1494,14 @@ VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow) 
     key.max_anisotropy = tss[kTssMaxAnisotropy];
     key.border_color = tss[kTssBorderColor];
     key.compare_enable = shadow;
-    key.compare_op = shadow ? ShadowCompareOp(state.rs[kRsShadowFunc]) : VK_COMPARE_OP_ALWAYS;
+    key.compare_op = shadow ? vulkan::ShadowCompareOp(state.rs[kRsShadowFunc]) : VK_COMPARE_OP_ALWAYS;
+    const bool border = key.address_u == 4 || key.address_v == 4 || key.address_w == 4;
+    const bool standard_border = key.border_color == 0 || key.border_color == 0xFF000000 || key.border_color == 0xFFFFFFFF;
+    const bool typed_custom_border = border && !standard_border &&
+                                     (!context_.CustomBorderColorWithoutFormatEnabled() ||
+                                      context_.CustomBorderColorFormatRequiresTyped(sampled_format));
+    if (border && !standard_border)
+        key.sampled_format = typed_custom_border ? sampled_format : VK_FORMAT_UNDEFINED;
     if (auto found = stage_samplers_.find(key); found != stage_samplers_.end()) return found->second;
 
     const bool mirror_clamp = key.address_u == 5 || key.address_v == 5 || key.address_w == 5;
@@ -1385,11 +1509,21 @@ VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow) 
         Fail("stage sampler", "D3D mirror-once address mode requires VK_KHR_sampler_mirror_clamp_to_edge");
         return VK_NULL_HANDLE;
     }
-    const bool border = key.address_u == 4 || key.address_v == 4 || key.address_w == 4;
-    const bool standard_border = key.border_color == 0 || key.border_color == 0xFF000000 || key.border_color == 0xFFFFFFFF;
     if (border && !standard_border) {
-        Fail("stage sampler", "custom D3D border colors are not supported by the enabled Vulkan device");
-        return VK_NULL_HANDLE;
+        if (!context_.CustomBorderColorEnabled()) {
+            Fail("stage sampler", "custom D3D border color requires VK_EXT_custom_border_color");
+            return VK_NULL_HANDLE;
+        }
+        if (!context_.MaxCustomBorderColorSamplers() ||
+            custom_border_sampler_count_ >= context_.MaxCustomBorderColorSamplers()) {
+            Fail("stage sampler", "custom D3D border color sampler limit exhausted");
+            return VK_NULL_HANDLE;
+        }
+        if (typed_custom_border &&
+            !context_.CustomBorderColorFormatSupported(sampled_format)) {
+            Fail("stage sampler", "custom D3D border color format is not supported for sampled images");
+            return VK_NULL_HANDLE;
+        }
     }
     auto create = DeviceProc<PFN_vkCreateSampler>(context_, "vkCreateSampler");
     if (!create) {
@@ -1398,6 +1532,13 @@ VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow) 
     }
     VkSamplerCreateInfo info = vulkan::MakeSamplerCreateInfo(
         tss, context_.Properties().limits.maxSamplerAnisotropy, context_.Properties().limits.maxSamplerLodBias);
+    vulkan::SamplerCustomBorderColorInfo custom_border_info;
+    if (border && !standard_border) {
+        custom_border_info = vulkan::MakeSamplerCustomBorderColorInfo(
+            key.border_color, typed_custom_border ? sampled_format : VK_FORMAT_UNDEFINED);
+        info.borderColor = VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+        info.pNext = &custom_border_info.extension;
+    }
     info.compareEnable = key.compare_enable ? VK_TRUE : VK_FALSE;
     info.compareOp = static_cast<VkCompareOp>(key.compare_op);
     VkSampler sampler = VK_NULL_HANDLE;
@@ -1408,6 +1549,7 @@ VkSampler VulkanBackend::SamplerFor(const State& state, int stage, bool shadow) 
     }
     stage_samplers_.emplace(key, sampler);
     samplers_.push_back(sampler);
+    if (border && !standard_border) ++custom_border_sampler_count_;
     return sampler;
 }
 
@@ -1431,7 +1573,7 @@ bool VulkanBackend::BeginRendering(Target* color, Target* depth, VkImageView col
         Transition(*depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
         if (!extent.width) extent = {depth->width, depth->height};
     }
-    auto begin = DeviceProc<PFN_vkCmdBeginRendering>(context_, "vkCmdBeginRendering");
+    auto begin = draw_dispatch_.begin_rendering;
     if (!begin || !extent.width || !extent.height || (!color_view && !depth))
         return Fail("rendering begin", "invalid dynamic-rendering attachment");
     VkRenderingAttachmentInfo color_attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1465,7 +1607,8 @@ bool VulkanBackend::BeginRendering(Target* color, Target* depth, VkImageView col
 
 void VulkanBackend::EndRendering() {
     if (!rendering_) return;
-    if (auto end = DeviceProc<PFN_vkCmdEndRendering>(context_, "vkCmdEndRendering")) end(command_);
+    if (draw_dispatch_.end_rendering) draw_dispatch_.end_rendering(command_);
+    else Fail("rendering end", "vkCmdEndRendering unavailable");
     rendering_ = false;
     rendering_color_ = rendering_depth_ = nullptr;
 }
@@ -1892,7 +2035,7 @@ bool VulkanBackend::AllocateDescriptors(const std::array<VkImageView, vulkan::kT
     std::string error;
     if (!descriptors_.Allocate(resources, set, error)) return Fail("descriptor allocation", error);
     descriptors_used_ = true;
-    if (perf_enabled_) ++perf_current_descriptor_sets_;
+    if (perf_enabled_) ++perf_current_descriptor_requests_;
     return true;
 }
 
@@ -1916,18 +2059,32 @@ const vulkan::DrawSources& VulkanBackend::DrawSourcesFor(const State& state, con
 bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, const PixelKey& pixel_key,
                                Target* color, Target* depth, const std::array<VkImageView, 4>& stage_views,
                                const std::array<VkSampler, 4>& stage_samplers, const DrawConstants& constants) {
+    std::chrono::steady_clock::time_point detail_start;
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
     const vulkan::DrawSources& sources = DrawSourcesFor(state, assembled, pixel_key);
     VkFormat color_format = color ? kColorFormat : VK_FORMAT_UNDEFINED;
     VkFormat depth_format = depth ? kDepthFormat : VK_FORMAT_UNDEFINED;
     VkPipeline pipeline = VK_NULL_HANDLE;
     PipelineKey pipeline_key;
     if (!CreateDrawPipeline(state, assembled, sources.vertex, sources.pixel, sources.geometry, color_format, depth_format,
-                            pipeline, pipeline_key))
+                            pipeline, pipeline_key)) {
+        if (perf_detail_frame_active_)
+            perf_current_detail_pipeline_source_ns_ += ElapsedNanoseconds(detail_start);
         return false;
+    }
+    if (perf_detail_frame_active_)
+        perf_current_detail_pipeline_source_ns_ += ElapsedNanoseconds(detail_start);
 
     vulkan::Buffer* constants_buffer = nullptr;
     std::array<uint32_t, vulkan::kDynamicConstantBindingCount> dynamic_offsets{};
-    if (!UploadDrawConstants(state, constants, constants_buffer, dynamic_offsets)) return false;
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (!UploadDrawConstants(state, constants, constants_buffer, dynamic_offsets)) {
+        if (perf_detail_frame_active_)
+            perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+        return false;
+    }
+    if (perf_detail_frame_active_)
+        perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
     std::array<VkImageView, vulkan::kTextureBindingCount> views{};
     views.fill(dummy_->View());
     std::array<VkSampler, vulkan::kSamplerBindingCount> samplers{};
@@ -1937,10 +2094,18 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         if (stage_samplers[size_t(i)]) samplers[size_t(i)] = stage_samplers[size_t(i)];
     }
     vulkan::DescriptorSet set;
-    if (!AllocateDescriptors(views, samplers, *constants_buffer, kConstantRange, set)) return false;
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (!AllocateDescriptors(views, samplers, *constants_buffer, kConstantRange, set)) {
+        if (perf_detail_frame_active_)
+            perf_current_detail_descriptor_lookup_allocation_ns_ += ElapsedNanoseconds(detail_start);
+        return false;
+    }
+    if (perf_detail_frame_active_)
+        perf_current_detail_descriptor_lookup_allocation_ns_ += ElapsedNanoseconds(detail_start);
 
     std::array<VkBuffer, 16> vertex_buffers{};
     std::array<VkDeviceSize, 16> vertex_offsets{};
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < assembled.buffer_count; ++i) {
         const VertexBuffer& source = assembled.buffers[i];
         vulkan::Buffer* buffer = nullptr;
@@ -1960,8 +2125,11 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         }
         std::string error;
         if (!AllocateUpload(std::max<uint32_t>(source.bytes, 4u), 16, buffer, offset) ||
-            !buffer->Write(offset, upload_source, source.bytes, error))
+            !buffer->Write(offset, upload_source, source.bytes, error)) {
+            if (perf_detail_frame_active_)
+                perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
             return Fail("vertex upload", error);
+        }
         vertex_buffers[i] = buffer->Handle();
         vertex_offsets[i] = offset;
         if (perf_enabled_ && perf_upload_trace_count_ < 12) {
@@ -1976,31 +2144,48 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         const uint64_t bytes = uint64_t(assembled.index_count) * (assembled.index16 ? 2u : 4u);
         std::string error;
         if (!AllocateUpload(bytes, 4, index_buffer, index_offset) ||
-            !index_buffer->Write(index_offset, assembled.index_src, size_t(bytes), error))
+            !index_buffer->Write(index_offset, assembled.index_src, size_t(bytes), error)) {
+            if (perf_detail_frame_active_)
+                perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
             return Fail("index upload", error);
+        }
         if (perf_enabled_ && perf_upload_trace_count_ < 12) {
             LOGR("vulkan: upload index block=%zu offset=%llu bytes=%llu", UploadBlockIndex(index_buffer),
                  (unsigned long long)index_offset, (unsigned long long)bytes);
             ++perf_upload_trace_count_;
         }
     }
+    if (perf_detail_frame_active_)
+        perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
 
-    if (!BeginRendering(color, depth)) return false;
-    auto bind_pipeline = DeviceProc<PFN_vkCmdBindPipeline>(context_, "vkCmdBindPipeline");
-    auto bind_vertex = DeviceProc<PFN_vkCmdBindVertexBuffers>(context_, "vkCmdBindVertexBuffers");
-    auto bind_index = DeviceProc<PFN_vkCmdBindIndexBuffer>(context_, "vkCmdBindIndexBuffer");
-    auto draw = DeviceProc<PFN_vkCmdDraw>(context_, "vkCmdDraw");
-    auto draw_indexed = DeviceProc<PFN_vkCmdDrawIndexed>(context_, "vkCmdDrawIndexed");
-    auto set_viewport = DeviceProc<PFN_vkCmdSetViewport>(context_, "vkCmdSetViewport");
-    auto set_scissor = DeviceProc<PFN_vkCmdSetScissor>(context_, "vkCmdSetScissor");
-    auto set_blend = DeviceProc<PFN_vkCmdSetBlendConstants>(context_, "vkCmdSetBlendConstants");
-    auto set_stencil = DeviceProc<PFN_vkCmdSetStencilReference>(context_, "vkCmdSetStencilReference");
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (!BeginRendering(color, depth)) {
+        if (perf_detail_frame_active_)
+            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
+        return false;
+    }
+    auto bind_pipeline = draw_dispatch_.bind_pipeline;
+    auto bind_vertex = draw_dispatch_.bind_vertex_buffers;
+    auto bind_index = draw_dispatch_.bind_index_buffer;
+    auto draw = draw_dispatch_.draw;
+    auto draw_indexed = draw_dispatch_.draw_indexed;
+    auto set_viewport = draw_dispatch_.set_viewport;
+    auto set_scissor = draw_dispatch_.set_scissor;
+    auto set_blend = draw_dispatch_.set_blend_constants;
+    auto set_stencil = draw_dispatch_.set_stencil_reference;
     if (!bind_pipeline || !bind_vertex || !bind_index || !draw || !draw_indexed || !set_viewport || !set_scissor ||
-        !set_blend || !set_stencil)
+        !set_blend || !set_stencil) {
+        if (perf_detail_frame_active_)
+            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
         return Fail("draw commands", "required Vulkan draw entry point unavailable");
+    }
     bind_pipeline(command_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     if (!descriptors_.Bind(command_, pipeline_layout_, set, dynamic_offsets, last_error_))
+    {
+        if (perf_detail_frame_active_)
+            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
         return Fail("descriptor bind", last_error_);
+    }
     Target* viewport_target = color ? color : depth;
     VkViewport viewport{0.0f, float(viewport_target->height), float(viewport_target->width), -float(viewport_target->height), 0.0f, 1.0f};
     set_viewport(command_, 0, 1, &viewport);
@@ -2039,6 +2224,8 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         depth->drawn = true;
         depth->drawn_generation = frame_generation_;
     }
+    if (perf_detail_frame_active_)
+        perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
     if (perf_enabled_) ++perf_current_draws_;
     return true;
 }
@@ -2292,7 +2479,13 @@ void VulkanBackend::Clear(const State& state, uint32_t count, const uint8_t* rec
 void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     if (!BeginFrame()) return;
     Assembled assembled;
+    std::chrono::steady_clock::time_point detail_start;
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
     if (!Assemble(state, prim, start, count, indices, assembled)) return;
+    if (perf_detail_frame_active_)
+        perf_current_detail_vertex_assembly_ns_ += ElapsedNanoseconds(detail_start);
+
+    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
     Target* color = nullptr;
     Target* depth = nullptr;
     if (!EnsureTarget(state.rt, false, color)) return;
@@ -2314,14 +2507,16 @@ void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint
         Texture* texture = nullptr;
         if (!EnsureTexture(state, stage, texture, desc)) return;
         if (!state.textures[size_t(stage)]) continue;
+        VkFormat sampled_format = VK_FORMAT_UNDEFINED;
         infos[size_t(stage)].kind = desc.cube ? kTexCube : desc.depth > 1 ? kTex3D : kTex2D;
         infos[size_t(stage)].rect = desc.linear ? 1 : 0;
         const FormatInfo& format = Format(desc.format);
-        infos[size_t(stage)].shadow = format.depth ? ShadowDepthKind(desc.format) : 0;
+        infos[size_t(stage)].shadow = format.depth ? vulkan::ShadowDepthKind(desc.format) : 0;
         texture_ids[size_t(stage)] = texture ? texture->id : 0;
         auto override = override_textures_.find(texture_ids[size_t(stage)]);
         if (override != override_textures_.end() && override->second.image) {
             views[size_t(stage)] = override->second.image->SampledView();
+            sampled_format = override->second.image->Format();
         } else if (auto it = targets_.find(SurfaceKey(Surface{.data = desc.data}, format.depth)); it != targets_.end() &&
                    CompatibleTarget(it->second, desc, format.depth)) {
             Target& sampled_target = it->second;
@@ -2342,13 +2537,21 @@ void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint
                 Transition(sampled_target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
                 views[size_t(stage)] = sampled_target.image->SampledView();
             }
+            sampled_format = sampled_target.image->Format();
         } else if (texture) {
             views[size_t(stage)] = texture->image->SampledView();
+            sampled_format = texture->image->Format();
             texture->used_generation = frame_generation_;
         }
-        samplers[size_t(stage)] = SamplerFor(state, stage, infos[size_t(stage)].shadow != 0);
+        if (sampled_format == VK_FORMAT_UNDEFINED) {
+            Fail("texture sampler", "sampled image has no Vulkan format");
+            return;
+        }
+        samplers[size_t(stage)] = SamplerFor(state, stage, infos[size_t(stage)].shadow != 0, sampled_format);
         if (!samplers[size_t(stage)]) return;
     }
+    if (perf_detail_frame_active_)
+        perf_current_detail_texture_target_sampler_ns_ += ElapsedNanoseconds(detail_start);
     PixelKey pixel_key = MakePixelKey(state, infos.data());
     pixel_key.quad = count <= 6 && !state.rs[kRsZEnable];
     if (g_hide_hud.load(std::memory_order_relaxed) && (state.layout2d & 0xff) == 1) return;
@@ -2661,6 +2864,7 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
 }
 
 void VulkanBackend::Present(const Surface& front) {
+    perf_trace_.Present(g_frame_stats.load() == 1);
     if (!BeginFrame()) return;
     Target* source = nullptr;
     if (!EnsureTarget(front, false, source)) return;

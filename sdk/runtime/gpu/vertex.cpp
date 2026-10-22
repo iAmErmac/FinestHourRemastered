@@ -464,6 +464,54 @@ void FvfInputs(uint32_t fvf, VertexShader& vs) {
     vs.stream_stride[0] = off;
 }
 
+void VertexProgramSlots::Load(uint32_t address, const uint32_t* words, uint32_t instructions) {
+    if (!words || !instructions || address >= kProgramSlots) return;
+    const uint32_t count = std::min(instructions, kProgramSlots - address);
+    std::memcpy(&slots_[address * 4], words, size_t(count) * 4 * sizeof(uint32_t));
+}
+
+std::shared_ptr<VertexShader> VertexProgramSlots::Select(uint32_t address, uint32_t handle,
+                                                         const VertexShader& declaration, bool* created) {
+    if (created) *created = false;
+    address = std::min(address, kProgramSlots - 1);
+    uint32_t program_end = address;
+    while (program_end < kProgramSlots && !(slots_[program_end * 4 + 3] & 1)) ++program_end;
+    program_end = std::min(program_end + 1, kProgramSlots);
+    const size_t begin = size_t(address) * 4, end = size_t(program_end) * 4;
+    uint64_t key = 0xCBF29CE484222325ull ^ handle;
+    for (size_t i = begin; i < end; ++i) key = (key ^ slots_[i]) * 0x100000001B3ull;
+    const auto range = selected_.equal_range(key);
+    for (auto it = range.first; it != range.second; ++it) {
+        const Selected& entry = it->second;
+        const auto& program = entry.shader->program;
+        if (entry.handle == handle && program.size() == end - begin &&
+            std::equal(program.begin(), program.end(), slots_.begin() + begin))
+            return entry.shader;
+    }
+
+    auto shader = std::make_shared<VertexShader>(declaration);
+    shader->program.assign(slots_.begin() + begin, slots_.begin() + end);
+    shader->program_type = 0x2078;
+    shader->hash = 0;
+    selected_.emplace(key, Selected{handle, shader});
+    if (created) *created = true;
+    return shader;
+}
+
+void VertexProgramSlots::Invalidate(uint32_t handle) {
+    for (auto it = selected_.begin(); it != selected_.end();) {
+        if (it->second.handle == handle)
+            it = selected_.erase(it);
+        else
+            ++it;
+    }
+}
+
+void VertexProgramSlots::Reset() {
+    slots_.fill(0);
+    selected_.clear();
+}
+
 std::shared_ptr<VertexShader> MakeImmediateVertexShader(const std::shared_ptr<VertexShader>& source, uint32_t mask) {
     auto result = std::make_shared<VertexShader>();
     if (source) {

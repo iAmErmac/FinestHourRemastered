@@ -23,6 +23,7 @@ void Image::Reset() {
     device_ = VK_NULL_HANDLE;
     view_ = VK_NULL_HANDLE;
     sampled_view_ = VK_NULL_HANDLE;
+    format_ = VK_FORMAT_UNDEFINED;
     image_ = VK_NULL_HANDLE;
     memory_ = VK_NULL_HANDLE;
     mip_levels_ = 1;
@@ -52,6 +53,7 @@ bool Image::Init(const Context& context, uint32_t width, uint32_t height, VkForm
     const uint32_t array_layers = image_type == VK_IMAGE_TYPE_3D ? 1 : layers;
     const VkImageCreateFlags create_flags = view_type == VK_IMAGE_VIEW_TYPE_CUBE ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
     device_ = context.Device();
+    format_ = format;
     auto create_image = reinterpret_cast<PFN_vkCreateImage>(context.DeviceProc("vkCreateImage"));
     destroy_image_ = reinterpret_cast<PFN_vkDestroyImage>(context.DeviceProc("vkDestroyImage"));
     auto requirements = reinterpret_cast<PFN_vkGetImageMemoryRequirements>(context.DeviceProc("vkGetImageMemoryRequirements"));
