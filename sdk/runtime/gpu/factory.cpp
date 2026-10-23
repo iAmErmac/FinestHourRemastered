@@ -2,6 +2,7 @@
 #include "gpu/vulkan/backend.h"
 
 #include "core/log.h"
+#include "app/app.h"
 
 #include <string>
 #include <string_view>
@@ -40,6 +41,10 @@ std::unique_ptr<Backend> CreateBackend() {
     }
     LocalFree(argv);
     if (!valid) return nullptr;
+    std::wstring title = app::kGame.title;
+    title += choice == Choice::Vulkan ? L" [Vulkan]" : L" [D3D12]";
+    if (app::Instance()) title += L" [" + std::to_wstring(app::Instance()) + L"]";
+    SetWindowTextW(static_cast<HWND>(app::Window()), title.c_str());
     if (choice == Choice::Vulkan) {
         LOGI("renderer: selected vulkan");
         return CreateVulkanBackend();

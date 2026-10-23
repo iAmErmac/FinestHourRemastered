@@ -47,6 +47,11 @@ enum class PresentStatus {
     Failed,
 };
 
+enum class SubmitWaitPolicy {
+    AllCommands,
+    ColorAttachmentOutput,
+};
+
 struct AcquireResult {
     AcquireStatus status = AcquireStatus::Failed;
     const void* owner = nullptr;
@@ -81,8 +86,12 @@ public:
     AcquireResult Acquire(uint64_t timeout_ns, std::string& error);
     // Records the caller's complete rendering command buffer. The component owns the acquire wait, render-complete
     // signal and render fence, so abort/retry paths never guess whether the acquire semaphore was consumed.
-    bool Submit(const AcquireResult& result, VkCommandBuffer command_buffer, std::string& error);
+    bool Submit(const AcquireResult& result, VkCommandBuffer command_buffer, std::string& error,
+                SubmitWaitPolicy wait_policy = SubmitWaitPolicy::AllCommands);
     VkFence RenderFence(const AcquireResult& result) const;
+    // Returns the reusable render fence for an acquired image before Submit resets it. Acquire has already
+    // waited any previous owner of this image, so callers must acknowledge that owner before submitting again.
+    VkFence RenderFenceForImage(uint32_t image_index) const;
     // Waits for all submitted rendering command buffers before their command pools or resources are reused.
     bool WaitForRendering(uint64_t timeout_ns, std::string& error);
     // Present consumes the image's render-complete semaphore after Submit succeeds. Its present fence is separate

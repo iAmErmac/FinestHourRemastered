@@ -83,8 +83,11 @@ bool Context::Init(std::string& error, bool enable_win32_wsi) {
 
 void Context::Reset() {
     if (device_ != VK_NULL_HANDLE) {
-        if (device_wait_idle_) device_wait_idle_(device_);
+        const bool idle = device_wait_idle_ && device_wait_idle_(device_) == VK_SUCCESS;
+        pipeline_cache_.Reset(idle);
         if (destroy_device_) destroy_device_(device_, nullptr);
+    } else {
+        pipeline_cache_.Reset();
     }
     device_ = VK_NULL_HANDLE;
     graphics_queue_ = VK_NULL_HANDLE;
@@ -105,6 +108,7 @@ void Context::Reset() {
     instance_ = VK_NULL_HANDLE;
     physical_device_ = VK_NULL_HANDLE;
     properties_ = {};
+    device_uuid_.fill(0);
     destroy_instance_ = nullptr;
     enumerate_physical_devices_ = nullptr;
     get_physical_device_properties_ = nullptr;
@@ -132,6 +136,11 @@ void Context::Reset() {
     debug_error_count_.store(0, std::memory_order_relaxed);
     debug_log_count_.store(0, std::memory_order_relaxed);
     loader_.Reset();
+}
+
+bool Context::PersistPipelineCache() {
+    if (device_ == VK_NULL_HANDLE || !device_wait_idle_ || device_wait_idle_(device_) != VK_SUCCESS) return false;
+    return pipeline_cache_.Persist();
 }
 
 PFN_vkVoidFunction Context::InstanceProc(const char* name) const {
@@ -476,12 +485,15 @@ bool Context::SelectPhysicalDevice(std::string& error) {
     if (custom_border_color_extension_available_) selected_features13.pNext = &selected_custom_border;
     get_physical_device_features2_(physical_device_, &selected_features);
     sampler_mirror_clamp_to_edge_enabled_ = selected_features12.samplerMirrorClampToEdge == VK_TRUE;
+    VkPhysicalDeviceProperties2 selected_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+    VkPhysicalDeviceIDProperties selected_id{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+    selected_properties.pNext = &selected_id;
+    VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_properties{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
+    if (custom_border_color_extension_available_) selected_id.pNext = &custom_properties;
+    get_physical_device_properties2_(physical_device_, &selected_properties);
+    std::copy(selected_id.deviceUUID, selected_id.deviceUUID + VK_UUID_SIZE, device_uuid_.begin());
     if (custom_border_color_extension_available_) {
-        VkPhysicalDeviceProperties2 selected_properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
-        VkPhysicalDeviceCustomBorderColorPropertiesEXT custom_properties{
-            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_PROPERTIES_EXT};
-        selected_properties.pNext = &custom_properties;
-        get_physical_device_properties2_(physical_device_, &selected_properties);
         custom_border_color_features_available_ = selected_custom_border.customBorderColors == VK_TRUE;
         custom_border_color_without_format_available_ =
             selected_custom_border.customBorderColorWithoutFormat == VK_TRUE;
@@ -598,6 +610,7 @@ bool Context::CreateDevice(std::string& error) {
         error = "Vulkan returned no graphics queue";
         return false;
     }
+    pipeline_cache_.Init(*this, pipeline_cache_directory_);
     return true;
 }
 

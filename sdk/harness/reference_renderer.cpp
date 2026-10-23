@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "core/log.h"
+#include "gpu/draw_constants.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -1142,16 +1143,38 @@ void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const u
                 const Viewport& v = s.viewport;
                 o.pos = V(v.x + (cp[0] / w + 1) * 0.5f * v.w, v.y + (1 - cp[1] / w) * 0.5f * v.h,
                           (v.min_z + cp[2] / w * (v.max_z - v.min_z)) * s.zscale, w);
+                if (s.rs[kRsRangeFogEnable]) {
+                    float view[3] = {q[0] * wv[0] + q[1] * wv[4] + q[2] * wv[8] + wv[12],
+                                     q[0] * wv[1] + q[1] * wv[5] + q[2] * wv[9] + wv[13],
+                                     q[0] * wv[2] + q[1] * wv[6] + q[2] * wv[10] + wv[14]};
+                    o.attr[kFog] = Splat(FogAmount(s, std::sqrt(view[0] * view[0] + view[1] * view[1] + view[2] * view[2])));
+                } else {
+                    const float view_z = q[0] * wv[2] + q[1] * wv[6] + q[2] * wv[10] + wv[14];
+                    o.attr[kFog] = Splat(FogAmount(s, view_z));
+                }
             }
             o.attr[kD0] = vp.in[3];
             o.attr[kD1] = slot[4] >= 0 ? vp.in[4] : Vec{};
             o.attr[kB0] = o.attr[kD0];
             o.attr[kB1] = o.attr[kD1];
-            o.attr[kFog] = Splat(FogAmount(s, std::fabs(o.pos[2] / s.zscale)));
+            if (as.pretransformed) {
+                float fog_coordinate = 0;
+                switch (draw_constants::PretransformedFogSource(s)) {
+                    case 1: fog_coordinate = q[2]; break;
+                    case 2: fog_coordinate = slot[4] >= 0 ? vp.in[4][3] : 0; break;
+                    default: fog_coordinate = q[3] == 0 ? 1 : 1 / q[3]; break;
+                }
+                const float fog_amount = !s.rs[kRsFogEnable] ? 1.0f
+                    : s.rs[kRsFogTableMode] == 0 ? std::clamp(fog_coordinate, 0.0f, 1.0f)
+                                                  : FogAmount(s, fog_coordinate);
+                o.attr[kFog] = Splat(fog_amount);
+            }
             for (int t = 0; t < 4; t++) o.attr[kT0 + t] = slot[9 + t] >= 0 ? vp.in[9 + t] : V(0, 0, 0, 1);
         }
         for (int a : {kD0, kD1, kB0, kB1})
             for (int j = 0; j < 4; j++) o.attr[a][j] = Sat(o.attr[a][j]);
+        if (!program && !as.pretransformed && s.rs[kRsFogEnable] && s.rs[kRsFogTableMode] == 0)
+            o.attr[kFog] = Splat(o.attr[kD1][3]);
         if (!s.rs[kRsSpecularEnable]) o.attr[kD1] = o.attr[kB1] = V(0, 0, 0, 1);
     }
 

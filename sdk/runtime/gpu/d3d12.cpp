@@ -604,6 +604,7 @@ public:
     bool DeliverLate(uint32_t data) override;
     void RecordLate(uint32_t data) override;
     void Flush() override;
+    void PrepareShutdown() override;
     void SetGamma(const uint8_t* ramp) override;
 
     ID3D12Device* Device() override { return dev_.Get(); }
@@ -780,7 +781,7 @@ private:
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps);
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                         GuestExtent size, DrawConstants& c);
+                         GuestExtent size, bool pretransformed, DrawConstants& c);
     void FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c);
     void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
@@ -1762,6 +1763,11 @@ void D3D12Backend::Submit(bool wait) {
 }
 
 void D3D12Backend::Flush() { Submit(true); }
+
+void D3D12Backend::PrepareShutdown() {
+    Flush();
+    SaveShaderCache();
+}
 
 void D3D12Backend::WaitFence(uint64_t value) {
     fence_->SetEventOnCompletion(value, event_);
@@ -4031,12 +4037,13 @@ constexpr int kLightTheta = 24;
 constexpr int kLightPhi = 25;
 
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestExtent size, DrawConstants& c) {
+                                   GuestExtent size, bool pretransformed, DrawConstants& c) {
     Alloc vc = Upload(sizeof(s.vsc) + kShadowConstantsTail, 256);
     std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
     last_vc_ = vc.gpu, last_tail_ = vc.cpu + sizeof(s.vsc);
     Alloc dc = Upload(sizeof(DrawConstants), 256);
     draw_constants::Surface(s, size.w, size.h, c);
+    draw_constants::PretransformedFog(s, pretransformed, c);
     draw_constants::Fog(s, sh.prog, c);
     draw_constants::Combiners(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
@@ -4938,8 +4945,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
             c.jitter[3] = 1.0f - float(sky_layer_++) * kSkyLayerStep;
         } else {
             sky_phase_ = false;
+            // Oil layers are consumed only by the optional sky-composition pass.
             for (uint32_t j = 0; j < 3; j++)
-                if (draw_tex0_ == kOilCloud[j] && k.zen) c.jitter[3] = 1.0f - float(16 + j) * kSkyLayerStep;
+                if (draw_tex0_ == kOilCloud[j] && k.zen && (app::Get().sun_moon || app::Get().clouds))
+                    c.jitter[3] = 1.0f - float(16 + j) * kSkyLayerStep;
             // the far water (far_water: drawn first of the river, before all that floats on it) at layer 20:
             // the sky pass leaves it as it is (scene_shaders.h skyfx)
             if (far_water) c.jitter[3] = 1.0f - 20.0f * kSkyLayerStep;
@@ -5091,7 +5100,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
         std::array<float, 16> w = ms.transforms[kTsWorld];
         if (carry(ms.transforms[kTsWorld].data())) world_back.s = &ms, world_back.w = w;
     }
-    UploadConstants(s, sh, k, stages, size, c);
+    UploadConstants(s, sh, k, stages, size, a.pretransformed, c);
     if (emitter && (glow.light || glow.impact > 0)) CollectEmitter(s, a, sh, glow);
 
     if (cap_) {

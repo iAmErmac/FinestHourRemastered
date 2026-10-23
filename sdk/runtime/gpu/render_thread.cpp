@@ -45,7 +45,7 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma };
+enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, PrepareShutdown, Gamma };
 
 struct Cmd {
     Op op;
@@ -223,6 +223,12 @@ public:
         if (Failed()) return;
         cur_->cmds.push_back(Cmd{Op::Flush});
         Wait(Submit(), WaitFor::Flush, "flush");
+    }
+
+    void PrepareShutdown() override {
+        if (Failed()) return;
+        cur_->cmds.push_back(Cmd{Op::PrepareShutdown});
+        Wait(Submit(), WaitFor::Flush, "prepare shutdown");
     }
 
     void SetGamma(const uint8_t* ramp) override {
@@ -491,6 +497,7 @@ private:
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
             case Op::Flush: inner_->Flush(); break;
+            case Op::PrepareShutdown: inner_->PrepareShutdown(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
         }
     }

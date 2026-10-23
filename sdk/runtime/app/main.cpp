@@ -26,6 +26,7 @@
 #include "gpu/backend.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
+#include "xdk/d3d8.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
@@ -260,7 +261,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetForegroundWindow(hwnd);
             return 0;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
+            PostQuitMessage(0);
             return 0;
         case WM_DESTROY:
             PostQuitMessage(0);
@@ -377,6 +378,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
     if (app::g_mode_changed) ChangeDisplaySettingsW(nullptr, 0);
+    d3d::PrepareBackendForExit();
     logx::Flush();
     kernel::Shutdown(0);
 }

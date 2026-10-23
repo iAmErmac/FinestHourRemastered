@@ -32,7 +32,11 @@ inline float Comparison(uint32_t value) {
 }  // namespace detail
 
 inline void Fog(const State& state, bool vertex_program, DrawConstants& out) {
-    if (!state.rs[kRsFogEnable]) return;
+    if (!state.rs[kRsFogEnable]) {
+        // Keep disabled fog distinct from direct table mode 0.
+        out.fog[3] = 4.0f;
+        return;
+    }
     // With no table fog, a vertex program's oFog is the blend factor.
     if (vertex_program && state.rs[kRsFogTableMode] == 0) {
         out.fog[0] = 1.0f;
@@ -52,6 +56,9 @@ inline void Surface(const State& state, uint32_t width, uint32_t height, DrawCon
     out.surf[1] = float(height);
     out.surf[2] = 1.0f / state.zscale;
     detail::Color(state.rs[kRsFogColor], out.fog_color);
+    // D3DRS_RANGEFOGENABLE is vertex fog state. Fog color alpha is ignored by D3D;
+    // carry the state bit here without changing the draw-constant layout.
+    out.fog_color[3] = state.rs[kRsRangeFogEnable] ? 1.0f : 0.0f;
     out.misc[0] = float(detail::Method(state, kMAlphaRef) & 0xFF);
     out.misc[1] = detail::Method(state, kMAlphaTestEnable)
                       ? detail::Comparison(detail::Method(state, kMAlphaFunc)) : 7.0f;
@@ -59,6 +66,17 @@ inline void Surface(const State& state, uint32_t width, uint32_t height, DrawCon
     out.misc[3] = state.rs[kRsSpecularEnable] ? 1.0f : 0.0f;
     if (out.layout[0] == 0) out.layout[0] = 1;
     if (out.layout_y[0] == 0) out.layout_y[0] = 1;
+}
+
+// Pretransformed source: 0=RHW, 1=Z, 2=specular alpha.
+inline uint32_t PretransformedFogSource(const State& state) {
+    if (state.rs[kRsFogTableMode] == 0) return 2;  // specular alpha
+    const auto& projection = state.transforms[3];
+    return projection[3] == 0.0f && projection[7] == 0.0f && projection[11] == 0.0f && projection[15] == 1.0f ? 1 : 0;
+}
+
+inline void PretransformedFog(const State& state, bool pretransformed, DrawConstants& out) {
+    if (pretransformed) out.fog_color[3] = float(PretransformedFogSource(state));
 }
 
 inline void Combiners(const State& state, DrawConstants& out) {

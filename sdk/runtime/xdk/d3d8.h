@@ -7,5 +7,6 @@ namespace d3d {
 
 gpu::State& State();
 std::recursive_mutex& Lock();
+void PrepareBackendForExit();
 
 }  // namespace d3d

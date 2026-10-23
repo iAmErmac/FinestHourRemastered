@@ -24,6 +24,10 @@ std::string ResultText(VkResult result) {
     return "VkResult " + std::to_string(static_cast<int>(result));
 }
 
+const char* SubmitWaitPolicyName(SubmitWaitPolicy policy) {
+    return policy == SubmitWaitPolicy::ColorAttachmentOutput ? "color_attachment_output" : "all_commands";
+}
+
 bool HasMode(const std::vector<VkPresentModeKHR>& modes, VkPresentModeKHR mode) {
     return std::find(modes.begin(), modes.end(), mode) != modes.end();
 }
@@ -678,7 +682,8 @@ bool Swapchain::ValidateAbandonResult(const AcquireResult& result, std::string& 
     return true;
 }
 
-bool Swapchain::Submit(const AcquireResult& result, VkCommandBuffer command_buffer, std::string& error) {
+bool Swapchain::Submit(const AcquireResult& result, VkCommandBuffer command_buffer, std::string& error,
+                       SubmitWaitPolicy wait_policy) {
     error.clear();
     if (!ValidateResult(result, error)) return false;
     if (submission_submitted_) {
@@ -702,7 +707,18 @@ bool Swapchain::Submit(const AcquireResult& result, VkCommandBuffer command_buff
     }
     VkSemaphoreSubmitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
     wait.semaphore = result.acquire_semaphore;
-    wait.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    const bool color_attachment_wait = wait_policy == SubmitWaitPolicy::ColorAttachmentOutput;
+    wait.stageMask = color_attachment_wait ? VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT
+                                           : VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    if (const char* perf = std::getenv("XBE_VK_PERF"); perf && *perf && *perf != '0') {
+        static bool logged_all_commands = false;
+        static bool logged_color_attachment = false;
+        bool& logged = color_attachment_wait ? logged_color_attachment : logged_all_commands;
+        if (!logged) {
+            LOGR("vulkan: swapchain acquire wait policy=%s", SubmitWaitPolicyName(wait_policy));
+            logged = true;
+        }
+    }
     VkCommandBufferSubmitInfo command{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
     command.commandBuffer = command_buffer;
     VkSemaphoreSubmitInfo signal{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
@@ -730,6 +746,10 @@ VkFence Swapchain::RenderFence(const AcquireResult& result) const {
     if (result.owner != this || result.image_index >= render_fences_.size() || !submission_submitted_)
         return VK_NULL_HANDLE;
     return render_fences_[result.image_index];
+}
+
+VkFence Swapchain::RenderFenceForImage(uint32_t image_index) const {
+    return image_index < render_fences_.size() ? render_fences_[image_index] : VK_NULL_HANDLE;
 }
 
 PresentStatus Swapchain::Present(const AcquireResult& result, std::string& error) {

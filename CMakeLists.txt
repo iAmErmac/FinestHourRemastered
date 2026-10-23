@@ -51,9 +51,10 @@ set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
 set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
 set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 set(BUILD_EXTERNAL OFF CACHE BOOL "" FORCE)
+set(CODF_GLSLANG_COMMIT a57276bf558f5cf94d3a9854ebdf5a2236849a5a)
 FetchContent_Declare(glslang
     GIT_REPOSITORY https://github.com/KhronosGroup/glslang.git
-    GIT_TAG a57276bf558f5cf94d3a9854ebdf5a2236849a5a
+    GIT_TAG ${CODF_GLSLANG_COMMIT}
     GIT_SHALLOW FALSE
 )
 FetchContent_MakeAvailable(glslang)
@@ -88,7 +89,9 @@ target_sources(CODFH PRIVATE
     sdk/runtime/gpu/vulkan/descriptors.cpp
     sdk/runtime/gpu/vulkan/pipeline.cpp
     sdk/runtime/gpu/vulkan/pipeline_state.cpp
+    sdk/runtime/gpu/vulkan/pipeline_cache.cpp
     sdk/runtime/gpu/vulkan/shader.cpp
+    sdk/runtime/gpu/vulkan/shader_cache.cpp
     sdk/runtime/gpu/vulkan/win32_surface.cpp
     sdk/runtime/gpu/vulkan/swapchain.cpp
     sdk/runtime/gpu/vulkan/sampler.cpp
@@ -96,6 +99,8 @@ target_sources(CODFH PRIVATE
     sdk/runtime/gpu/vulkan/upload_allocator.cpp
     sdk/runtime/gpu/vulkan/backend.cpp
 )
+set_source_files_properties(sdk/runtime/gpu/vulkan/shader.cpp PROPERTIES
+    COMPILE_DEFINITIONS CODF_GLSLANG_COMMIT=\"${CODF_GLSLANG_COMMIT}\")
 target_link_libraries(CODFH PRIVATE Vulkan::Headers glslang glslang-default-resource-limits)
 target_sources(CODFH PRIVATE src/codfh.rc)
 set_source_files_properties(src/codfh.rc PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tools/installer/art/app.ico)

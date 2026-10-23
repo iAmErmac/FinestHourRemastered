@@ -199,7 +199,7 @@ bool GraphicsPipeline::Init(const Context& context, const DescriptorArena& descr
     pipeline.pColorBlendState = &blend;
     pipeline.pDynamicState = &dynamic;
     pipeline.layout = layout_;
-    const VkResult result = create_pipeline(device_, VK_NULL_HANDLE, 1, &pipeline, nullptr, &pipeline_);
+    const VkResult result = create_pipeline(device_, context.PipelineCacheHandle(), 1, &pipeline, nullptr, &pipeline_);
     for (VkShaderModule module : modules)
         if (module) destroy_shader_module_(device_, module, nullptr);
     if (result != VK_SUCCESS) {

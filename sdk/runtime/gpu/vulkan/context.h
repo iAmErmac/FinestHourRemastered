@@ -4,10 +4,14 @@
 #include <vulkan/vulkan.h>
 
 #include "gpu/vulkan/loader.h"
+#include "gpu/vulkan/pipeline_cache.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <string>
+#include <utility>
 
 namespace gpu::vulkan {
 
@@ -29,6 +33,11 @@ public:
     VkQueue GraphicsQueue() const { return graphics_queue_; }
     uint32_t GraphicsQueueFamily() const { return graphics_queue_family_; }
     const VkPhysicalDeviceProperties& Properties() const { return properties_; }
+    const std::array<uint8_t, VK_UUID_SIZE>& DeviceUUID() const { return device_uuid_; }
+    void SetPipelineCacheDirectory(std::filesystem::path directory) { pipeline_cache_directory_ = std::move(directory); }
+    VkPipelineCache PipelineCacheHandle() const { return pipeline_cache_.Handle(); }
+    const PipelineCacheStats& PipelineCacheStatus() const { return pipeline_cache_.Stats(); }
+    bool PersistPipelineCache();
     bool SwapchainMaintenance1Enabled() const { return swapchain_maintenance1_enabled_; }
     bool SamplerMirrorClampToEdgeEnabled() const { return sampler_mirror_clamp_to_edge_enabled_; }
     bool CustomBorderColorExtensionAvailable() const { return custom_border_color_extension_available_; }
@@ -66,6 +75,7 @@ private:
     VkDebugUtilsMessengerEXT debug_messenger_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties_{};
+    std::array<uint8_t, VK_UUID_SIZE> device_uuid_{};
     VkDevice device_ = VK_NULL_HANDLE;
     VkQueue graphics_queue_ = VK_NULL_HANDLE;
     uint32_t graphics_queue_family_ = VK_QUEUE_FAMILY_IGNORED;
@@ -84,6 +94,8 @@ private:
     PFN_vkDestroyDevice destroy_device_ = nullptr;
     PFN_vkDeviceWaitIdle device_wait_idle_ = nullptr;
     PFN_vkGetDeviceQueue get_device_queue_ = nullptr;
+    PipelineCache pipeline_cache_;
+    std::filesystem::path pipeline_cache_directory_;
     PFN_vkCreateDebugUtilsMessengerEXT create_debug_messenger_ = nullptr;
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_debug_messenger_ = nullptr;
     bool enable_win32_wsi_ = false;

@@ -183,6 +183,7 @@ void FillTransformConstants(const State& state, uint32_t width, uint32_t height,
 void FillConstants(const State& state, uint32_t width, uint32_t height, bool vertex_program, bool pretransformed,
                    const FixedKey& fixed, const std::array<TexInfo, 4>& infos, DrawConstants& constants) {
     draw_constants::Surface(state, width, height, constants);
+    draw_constants::PretransformedFog(state, pretransformed, constants);
     draw_constants::Fog(state, vertex_program, constants);
     draw_constants::Combiners(state, constants);
     for (int stage = 0; stage < 4; ++stage) {
@@ -207,7 +208,8 @@ void FillConstants(const State& state, uint32_t width, uint32_t height, bool ver
 }
 
 uint64_t SurfaceKey(const Surface& surface, bool depth) {
-    return (uint64_t(surface.data) << 1) | uint64_t(depth);
+    const uint32_t data = surface.data ? mem::VirtualFromPhysical(surface.data) : 0;
+    return (uint64_t(data) << 1) | uint64_t(depth);
 }
 
 bool SameLateDesc(const TextureDesc& a, const TextureDesc& b) {
@@ -347,7 +349,11 @@ VulkanBackend::~VulkanBackend() {
             std::abort();
         }
     }
-    if (perf_frame_active_ && perf_frame_ended_) FinishPerfFrame(0);
+    for (uint32_t i = 0; i < kFrameContextCount; ++i) {
+        active_frame_index_ = i;
+        active_frame_ = &frame_contexts_[i];
+        if (ActiveFrame().perf_frame_active && ActiveFrame().perf_frame_ended) FinishPerfFrame(0);
+    }
     if (perf_enabled_) ReportPerfWindow();
     ResetPerfQueries();
     if (ui_initialized_) {
@@ -366,7 +372,13 @@ VulkanBackend::~VulkanBackend() {
     screenshot_buffer_.reset();
     pending_override_uploads_.clear();
     override_textures_.clear();
-    batch_.Reset();
+    for (auto& frame : frame_contexts_) {
+        frame.frame_buffers.clear();
+        frame.uploads.Reset();
+        frame.frame_images.clear();
+        frame.descriptors.Reset();
+        frame.batch.Reset();
+    }
     // Late readback buffers are also batch-referenced; the batch has retired before their owners are destroyed.
     {
         std::lock_guard lock(late_lock_);
@@ -391,17 +403,14 @@ VulkanBackend::~VulkanBackend() {
     blit_pipeline_ = VK_NULL_HANDLE;
     linear_sampler_ = point_sampler_ = VK_NULL_HANDLE;
     pipeline_layout_ = VK_NULL_HANDLE;
-    frame_buffers_.clear();
-    uploads_.Reset();
-    frame_images_.clear();
+    sky_scene_color_ = sky_scene_depth_ = nullptr;
+    sky_scene_done_ = false;
     textures_.clear();
     targets_.clear();
     dummy_.reset();
     samplers_.clear();
     stage_samplers_.clear();
     custom_border_sampler_count_ = 0;
-    descriptors_.Reset();
-    batch_.Reset();
     swapchain_.Reset();
     surface_.Reset();
     ClearDrawDispatch();
@@ -521,6 +530,7 @@ bool VulkanBackend::InitPerfQueries(uint32_t forced_interval) {
     perf_detail_enabled_ = trace_requested && detail && std::strcmp(detail, "1") == 0;
     if (!forced_interval && (!value || !value[0] || value[0] == '0') && !trace_requested) return true;
     perf_enabled_ = true;
+    perf_counters_enabled_.store(true, std::memory_order_relaxed);
     perf_interval_ = forced_interval ? forced_interval :
                                       value && value[0] && value[0] != '0'
                                           ? std::max(1u, static_cast<uint32_t>(std::strtoul(value, nullptr, 10)))
@@ -538,9 +548,16 @@ bool VulkanBackend::InitPerfQueries(uint32_t forced_interval) {
     info.queryType = VK_QUERY_TYPE_TIMESTAMP;
     info.queryCount = 2;
     std::string error;
-    if (!Result(create(context_.Device(), &info, nullptr, &perf_query_pool_), "vkCreateQueryPool", error)) {
+    bool created = true;
+    for (auto& frame : frame_contexts_) {
+        if (!Result(create(context_.Device(), &info, nullptr, &frame.perf_query_pool), "vkCreateQueryPool", error)) {
+            created = false;
+            break;
+        }
+    }
+    if (!created) {
         LOGW("vulkan: XBE_VK_PERF GPU timestamps disabled: %s", error.c_str());
-        perf_query_pool_ = VK_NULL_HANDLE;
+        ResetPerfQueries();
     } else {
         LOGR("vulkan: perf diagnostics enabled interval=%u gpu_timestamps=on detail=%s", perf_interval_,
              perf_detail_enabled_ ? "trace-opt-in" : "off");
@@ -560,43 +577,43 @@ void VulkanBackend::ClearDrawDispatch() {
 }
 
 void VulkanBackend::ResetPerfQueries() {
-    if (perf_query_pool_) {
-        auto destroy = DeviceProc<PFN_vkDestroyQueryPool>(context_, "vkDestroyQueryPool");
-        if (destroy) destroy(context_.Device(), perf_query_pool_, nullptr);
+    auto destroy = DeviceProc<PFN_vkDestroyQueryPool>(context_, "vkDestroyQueryPool");
+    for (auto& frame : frame_contexts_) {
+        if (frame.perf_query_pool && destroy) destroy(context_.Device(), frame.perf_query_pool, nullptr);
+        frame.perf_query_pool = VK_NULL_HANDLE;
+        frame.perf_frame_active = false;
+        frame.perf_detail_frame_active = false;
+        frame.perf_frame_ended = false;
+        frame.perf_query_pending = false;
     }
-    perf_query_pool_ = VK_NULL_HANDLE;
-    perf_frame_active_ = false;
-    perf_detail_frame_active_ = false;
-    perf_frame_ended_ = false;
-    perf_query_pending_ = false;
 }
 
 void VulkanBackend::BeginPerfFrame() {
     if (!perf_enabled_) return;
-    perf_current_draws_ = perf_current_pipeline_misses_ = perf_current_shader_modules_ = 0;
-    perf_current_source_hits_ = perf_current_source_misses_ = 0;
-    perf_current_texture_uploads_ = perf_current_descriptor_requests_ = 0;
-    perf_current_record_ns_ = perf_current_wait_ns_ = 0;
-    perf_current_detail_vertex_assembly_ns_ = 0;
-    perf_current_detail_texture_target_sampler_ns_ = 0;
-    perf_current_detail_pipeline_source_ns_ = 0;
-    perf_current_detail_constant_vertex_index_upload_ns_ = 0;
-    perf_current_detail_descriptor_lookup_allocation_ns_ = 0;
-    perf_current_detail_command_recording_ns_ = 0;
-    perf_current_detail_swapchain_render_wait_ns_ = 0;
-    perf_current_detail_batch_completion_wait_ns_ = 0;
-    perf_current_detail_late_publish_ns_ = 0;
-    perf_current_detail_descriptor_retire_ns_ = 0;
-    perf_current_detail_resource_retire_ns_ = 0;
-    perf_current_upload_allocations_ = perf_current_upload_bytes_ = perf_current_upload_block_grows_ = 0;
-    perf_current_gpu_valid_ = false;
-    perf_current_gpu_ms_ = 0.0;
-    perf_frame_start_ = std::chrono::steady_clock::now();
-    perf_frame_active_ = true;
-    perf_detail_frame_active_ = perf_detail_enabled_ && g_frame_stats.load(std::memory_order_relaxed) == 1;
-    perf_frame_ended_ = false;
-    perf_query_pending_ = false;
-    if (!perf_query_pool_) return;
+    ActiveFrame().perf_current_draws = ActiveFrame().perf_current_pipeline_misses = ActiveFrame().perf_current_shader_modules = 0;
+    ActiveFrame().perf_current_source_hits = ActiveFrame().perf_current_source_misses = 0;
+    ActiveFrame().perf_current_texture_uploads = ActiveFrame().perf_current_descriptor_requests = 0;
+    ActiveFrame().perf_current_record_ns = ActiveFrame().perf_current_wait_ns = 0;
+    ActiveFrame().perf_current_detail_vertex_assembly_ns = 0;
+    ActiveFrame().perf_current_detail_texture_target_sampler_ns = 0;
+    ActiveFrame().perf_current_detail_pipeline_source_ns = 0;
+    ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns = 0;
+    ActiveFrame().perf_current_detail_descriptor_lookup_allocation_ns = 0;
+    ActiveFrame().perf_current_detail_command_recording_ns = 0;
+    ActiveFrame().perf_current_detail_swapchain_render_wait_ns = 0;
+    ActiveFrame().perf_current_detail_batch_completion_wait_ns = 0;
+    ActiveFrame().perf_current_detail_late_publish_ns = 0;
+    ActiveFrame().perf_current_detail_descriptor_retire_ns = 0;
+    ActiveFrame().perf_current_detail_resource_retire_ns = 0;
+    ActiveFrame().perf_current_upload_allocations = ActiveFrame().perf_current_upload_bytes = ActiveFrame().perf_current_upload_block_grows = 0;
+    ActiveFrame().perf_current_gpu_valid = false;
+    ActiveFrame().perf_current_gpu_ms = 0.0;
+    ActiveFrame().perf_frame_start = std::chrono::steady_clock::now();
+    ActiveFrame().perf_frame_active = true;
+    ActiveFrame().perf_detail_frame_active = perf_detail_enabled_ && g_frame_stats.load(std::memory_order_relaxed) == 1;
+    ActiveFrame().perf_frame_ended = false;
+    ActiveFrame().perf_query_pending = false;
+    if (!ActiveFrame().perf_query_pool) return;
     auto reset = DeviceProc<PFN_vkCmdResetQueryPool>(context_, "vkCmdResetQueryPool");
     auto write = DeviceProc<PFN_vkCmdWriteTimestamp>(context_, "vkCmdWriteTimestamp");
     if (!reset || !write) {
@@ -604,30 +621,42 @@ void VulkanBackend::BeginPerfFrame() {
         ResetPerfQueries();
         return;
     }
-    reset(command_, perf_query_pool_, 0, 2);
-    write(command_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, perf_query_pool_, 0);
-    perf_query_pending_ = true;
+    reset(ActiveFrame().command, ActiveFrame().perf_query_pool, 0, 2);
+    write(ActiveFrame().command, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ActiveFrame().perf_query_pool, 0);
+    ActiveFrame().perf_query_pending = true;
 }
 
 void VulkanBackend::EndPerfFrame() {
-    if (!perf_enabled_ || !perf_frame_active_ || perf_frame_ended_) return;
-    perf_current_record_ns_ = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - perf_frame_start_).count());
-    if (perf_query_pending_) {
+    if (!perf_enabled_ || !ActiveFrame().perf_frame_active || ActiveFrame().perf_frame_ended) return;
+    ActiveFrame().perf_current_record_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - ActiveFrame().perf_frame_start).count());
+    if (ActiveFrame().perf_query_pending) {
         auto write = DeviceProc<PFN_vkCmdWriteTimestamp>(context_, "vkCmdWriteTimestamp");
-        if (write) write(command_, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, perf_query_pool_, 1);
+        if (write) write(ActiveFrame().command, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ActiveFrame().perf_query_pool, 1);
     }
-    perf_frame_ended_ = true;
+    ActiveFrame().perf_frame_ended = true;
 }
 
 void VulkanBackend::ReportPerfWindow() {
     if (!perf_window_frames_) return;
+    const uint64_t sync_requests = perf_window_sync_requests_.exchange(0, std::memory_order_relaxed);
+    const uint64_t deliver_late_hits = perf_window_deliver_late_hits_.exchange(0, std::memory_order_relaxed);
+    const uint64_t deliver_late_misses = perf_window_deliver_late_misses_.exchange(0, std::memory_order_relaxed);
+    const uint64_t record_late_accepted = perf_window_record_late_accepted_.exchange(0, std::memory_order_relaxed);
+    const uint64_t record_late_skips = perf_window_record_late_skips_.exchange(0, std::memory_order_relaxed);
+    const uint64_t guest_writeback_successes =
+        perf_window_guest_writeback_successes_.exchange(0, std::memory_order_relaxed);
+    const vulkan::ShaderCacheStats shader_cache_stats = shader_cache_.Stats();
+    const vulkan::PipelineCacheStats pipeline_cache_stats = context_.PipelineCacheStatus();
     const double frames = double(perf_window_frames_);
     const auto ms = [](uint64_t ns) { return double(ns) / 1000000.0; };
     if (perf_window_gpu_samples_) {
         LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptor_requests=%llu "
              "sources_hit=%llu sources_miss=%llu upload_allocs=%llu upload_kib=%.1f block_grows=%llu rewinds=%llu peak_blocks=%zu "
-             "record_ms=%.2f wait_ms=%.2f gpu_ms=%.2f",
+             "record_ms=%.2f wait_ms=%.2f gpu_ms=%.2f sync_requests=%llu late_deliver_hits=%llu "
+             "late_deliver_misses=%llu late_record_accepted=%llu late_record_skips=%llu guest_writeback_successes=%llu "
+             "shader_cache_hits=%llu shader_cache_misses=%llu shader_cache_compiler_invocations=%llu "
+             "pipeline_cache_enabled=%s pipeline_cache_loaded=%s",
              (unsigned long long)perf_window_frames_, (unsigned long long)perf_window_draws_,
              (unsigned long long)perf_window_pipeline_misses_, (unsigned long long)perf_window_shader_modules_,
              (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_requests_,
@@ -636,19 +665,33 @@ void VulkanBackend::ReportPerfWindow() {
              (unsigned long long)perf_window_upload_block_grows_, (unsigned long long)perf_window_upload_rewinds_,
              perf_window_peak_upload_blocks_,
              ms(perf_window_record_ns_) / frames, ms(perf_window_wait_ns_) / frames,
-             perf_window_gpu_ms_ / double(perf_window_gpu_samples_));
+             perf_window_gpu_ms_ / double(perf_window_gpu_samples_), (unsigned long long)sync_requests,
+             (unsigned long long)deliver_late_hits, (unsigned long long)deliver_late_misses,
+             (unsigned long long)record_late_accepted, (unsigned long long)record_late_skips,
+             (unsigned long long)guest_writeback_successes,
+             (unsigned long long)shader_cache_stats.hits, (unsigned long long)shader_cache_stats.misses,
+             (unsigned long long)shader_cache_stats.compiler_invocations,
+             pipeline_cache_stats.enabled ? "1" : "0", pipeline_cache_stats.loaded_from_disk ? "1" : "0");
     } else {
         LOGR("vulkan: perf frames=%llu draws=%llu pipelines=%llu shaders=%llu textures=%llu descriptor_requests=%llu "
              "sources_hit=%llu sources_miss=%llu upload_allocs=%llu upload_kib=%.1f block_grows=%llu rewinds=%llu peak_blocks=%zu "
-             "record_ms=%.2f wait_ms=%.2f gpu_ms=unavailable",
+             "record_ms=%.2f wait_ms=%.2f gpu_ms=unavailable sync_requests=%llu late_deliver_hits=%llu "
+             "late_deliver_misses=%llu late_record_accepted=%llu late_record_skips=%llu guest_writeback_successes=%llu "
+             "shader_cache_hits=%llu shader_cache_misses=%llu shader_cache_compiler_invocations=%llu "
+             "pipeline_cache_enabled=%s pipeline_cache_loaded=%s",
              (unsigned long long)perf_window_frames_, (unsigned long long)perf_window_draws_,
              (unsigned long long)perf_window_pipeline_misses_, (unsigned long long)perf_window_shader_modules_,
              (unsigned long long)perf_window_texture_uploads_, (unsigned long long)perf_window_descriptor_requests_,
              (unsigned long long)perf_window_source_hits_, (unsigned long long)perf_window_source_misses_,
              (unsigned long long)perf_window_upload_allocations_, double(perf_window_upload_bytes_) / 1024.0,
              (unsigned long long)perf_window_upload_block_grows_, (unsigned long long)perf_window_upload_rewinds_,
-             perf_window_peak_upload_blocks_,
-             ms(perf_window_record_ns_) / frames, ms(perf_window_wait_ns_) / frames);
+             perf_window_peak_upload_blocks_, ms(perf_window_record_ns_) / frames, ms(perf_window_wait_ns_) / frames,
+             (unsigned long long)sync_requests, (unsigned long long)deliver_late_hits,
+             (unsigned long long)deliver_late_misses, (unsigned long long)record_late_accepted,
+             (unsigned long long)record_late_skips, (unsigned long long)guest_writeback_successes,
+             (unsigned long long)shader_cache_stats.hits, (unsigned long long)shader_cache_stats.misses,
+             (unsigned long long)shader_cache_stats.compiler_invocations,
+             pipeline_cache_stats.enabled ? "1" : "0", pipeline_cache_stats.loaded_from_disk ? "1" : "0");
     }
     perf_window_frames_ = perf_window_draws_ = perf_window_pipeline_misses_ = perf_window_shader_modules_ = 0;
     perf_window_source_hits_ = perf_window_source_misses_ = 0;
@@ -662,93 +705,93 @@ void VulkanBackend::ReportPerfWindow() {
 }
 
 void VulkanBackend::FinishPerfFrame(uint64_t wait_ns) {
-    if (!perf_enabled_ || !perf_frame_active_ || !perf_frame_ended_) return;
+    if (!perf_enabled_ || !ActiveFrame().perf_frame_active || !ActiveFrame().perf_frame_ended) return;
     if (g_frame_stats.load() == 2) perf_trace_.Stop();
-    perf_current_wait_ns_ = wait_ns;
-    perf_current_frame_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - perf_frame_start_).count();
-    if (perf_query_pending_) {
+    ActiveFrame().perf_current_wait_ns = wait_ns;
+    ActiveFrame().perf_current_frame_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ActiveFrame().perf_frame_start).count();
+    if (ActiveFrame().perf_query_pending) {
         uint64_t timestamps[2] = {};
         auto get = DeviceProc<PFN_vkGetQueryPoolResults>(context_, "vkGetQueryPoolResults");
-        const VkResult result = get ? get(context_.Device(), perf_query_pool_, 0, 2, sizeof(timestamps), timestamps,
+        const VkResult result = get ? get(context_.Device(), ActiveFrame().perf_query_pool, 0, 2, sizeof(timestamps), timestamps,
                                           sizeof(uint64_t), VK_QUERY_RESULT_64_BIT)
                                     : VK_ERROR_INITIALIZATION_FAILED;
         if (result == VK_SUCCESS && timestamps[1] >= timestamps[0]) {
-            perf_current_gpu_valid_ = true;
-            perf_current_gpu_ms_ = double(timestamps[1] - timestamps[0]) *
+            ActiveFrame().perf_current_gpu_valid = true;
+            ActiveFrame().perf_current_gpu_ms = double(timestamps[1] - timestamps[0]) *
                                    double(context_.Properties().limits.timestampPeriod) / 1000000.0;
         }
     }
     ++perf_window_frames_;
-    perf_window_draws_ += perf_current_draws_;
-    perf_window_pipeline_misses_ += perf_current_pipeline_misses_;
-    perf_window_shader_modules_ += perf_current_shader_modules_;
-    perf_window_source_hits_ += perf_current_source_hits_;
-    perf_window_source_misses_ += perf_current_source_misses_;
-    perf_window_texture_uploads_ += perf_current_texture_uploads_;
-    perf_window_descriptor_requests_ += perf_current_descriptor_requests_;
-    perf_window_record_ns_ += perf_current_record_ns_;
-    perf_window_wait_ns_ += perf_current_wait_ns_;
-    perf_window_upload_allocations_ += perf_current_upload_allocations_;
-    perf_window_upload_bytes_ += perf_current_upload_bytes_;
-    perf_window_upload_block_grows_ += perf_current_upload_block_grows_;
-    perf_window_peak_upload_blocks_ = std::max(perf_window_peak_upload_blocks_, uploads_.BlockCount());
-    if (perf_current_gpu_valid_) {
+    perf_window_draws_ += ActiveFrame().perf_current_draws;
+    perf_window_pipeline_misses_ += ActiveFrame().perf_current_pipeline_misses;
+    perf_window_shader_modules_ += ActiveFrame().perf_current_shader_modules;
+    perf_window_source_hits_ += ActiveFrame().perf_current_source_hits;
+    perf_window_source_misses_ += ActiveFrame().perf_current_source_misses;
+    perf_window_texture_uploads_ += ActiveFrame().perf_current_texture_uploads;
+    perf_window_descriptor_requests_ += ActiveFrame().perf_current_descriptor_requests;
+    perf_window_record_ns_ += ActiveFrame().perf_current_record_ns;
+    perf_window_wait_ns_ += ActiveFrame().perf_current_wait_ns;
+    perf_window_upload_allocations_ += ActiveFrame().perf_current_upload_allocations;
+    perf_window_upload_bytes_ += ActiveFrame().perf_current_upload_bytes;
+    perf_window_upload_block_grows_ += ActiveFrame().perf_current_upload_block_grows;
+    perf_window_peak_upload_blocks_ = std::max(perf_window_peak_upload_blocks_, ActiveFrame().uploads.BlockCount());
+    if (ActiveFrame().perf_current_gpu_valid) {
         ++perf_window_gpu_samples_;
-        perf_window_gpu_ms_ += perf_current_gpu_ms_;
+        perf_window_gpu_ms_ += ActiveFrame().perf_current_gpu_ms;
     }
-    if (g_frame_stats.load() == 1 && perf_current_frame_ms_ > 0.0 && perf_trace_.Enabled()) {
+    if (g_frame_stats.load() == 1 && ActiveFrame().perf_current_frame_ms > 0.0 && perf_trace_.Enabled()) {
         diag::PerfFrameSample sample;
         sample.index = perf_trace_frame_index_++;
-        sample.renderer_sample_ms = perf_current_frame_ms_;
-        sample.record_ms = double(perf_current_record_ns_) / 1000000.0;
-        sample.wait_ms = double(perf_current_wait_ns_) / 1000000.0;
-        if (perf_current_gpu_valid_) sample.gpu_ms = perf_current_gpu_ms_;
-        sample.draws = perf_current_draws_;
-        sample.shader_events = perf_current_shader_modules_;
-        sample.pipeline_events = perf_current_pipeline_misses_;
-        sample.texture_uploads = perf_current_texture_uploads_;
-        sample.auxiliary_events = perf_current_descriptor_requests_;
-        sample.source_hits = perf_current_source_hits_;
-        sample.source_misses = perf_current_source_misses_;
-        if (perf_detail_frame_active_) {
+        sample.renderer_sample_ms = ActiveFrame().perf_current_frame_ms;
+        sample.record_ms = double(ActiveFrame().perf_current_record_ns) / 1000000.0;
+        sample.wait_ms = double(ActiveFrame().perf_current_wait_ns) / 1000000.0;
+        if (ActiveFrame().perf_current_gpu_valid) sample.gpu_ms = ActiveFrame().perf_current_gpu_ms;
+        sample.draws = ActiveFrame().perf_current_draws;
+        sample.shader_events = ActiveFrame().perf_current_shader_modules;
+        sample.pipeline_events = ActiveFrame().perf_current_pipeline_misses;
+        sample.texture_uploads = ActiveFrame().perf_current_texture_uploads;
+        sample.auxiliary_events = ActiveFrame().perf_current_descriptor_requests;
+        sample.source_hits = ActiveFrame().perf_current_source_hits;
+        sample.source_misses = ActiveFrame().perf_current_source_misses;
+        if (ActiveFrame().perf_detail_frame_active) {
             const auto detail_ms = [](uint64_t ns) { return double(ns) / 1000000.0; };
-            const uint64_t phase_sum_ns = perf_current_detail_vertex_assembly_ns_ +
-                                          perf_current_detail_texture_target_sampler_ns_ +
-                                          perf_current_detail_pipeline_source_ns_ +
-                                          perf_current_detail_constant_vertex_index_upload_ns_ +
-                                          perf_current_detail_descriptor_lookup_allocation_ns_ +
-                                          perf_current_detail_command_recording_ns_;
-            sample.detail_vertex_assembly_ms = detail_ms(perf_current_detail_vertex_assembly_ns_);
-            sample.detail_texture_target_sampler_ms = detail_ms(perf_current_detail_texture_target_sampler_ns_);
-            sample.detail_pipeline_source_ms = detail_ms(perf_current_detail_pipeline_source_ns_);
+            const uint64_t phase_sum_ns = ActiveFrame().perf_current_detail_vertex_assembly_ns +
+                                          ActiveFrame().perf_current_detail_texture_target_sampler_ns +
+                                          ActiveFrame().perf_current_detail_pipeline_source_ns +
+                                          ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns +
+                                          ActiveFrame().perf_current_detail_descriptor_lookup_allocation_ns +
+                                          ActiveFrame().perf_current_detail_command_recording_ns;
+            sample.detail_vertex_assembly_ms = detail_ms(ActiveFrame().perf_current_detail_vertex_assembly_ns);
+            sample.detail_texture_target_sampler_ms = detail_ms(ActiveFrame().perf_current_detail_texture_target_sampler_ns);
+            sample.detail_pipeline_source_ms = detail_ms(ActiveFrame().perf_current_detail_pipeline_source_ns);
             sample.detail_constant_vertex_index_upload_ms =
-                detail_ms(perf_current_detail_constant_vertex_index_upload_ns_);
+                detail_ms(ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns);
             sample.detail_descriptor_lookup_allocation_ms =
-                detail_ms(perf_current_detail_descriptor_lookup_allocation_ns_);
-            sample.detail_command_recording_ms = detail_ms(perf_current_detail_command_recording_ns_);
+                detail_ms(ActiveFrame().perf_current_detail_descriptor_lookup_allocation_ns);
+            sample.detail_command_recording_ms = detail_ms(ActiveFrame().perf_current_detail_command_recording_ns);
             sample.detail_phase_sum_ms = detail_ms(phase_sum_ns);
-            sample.detail_record_residual_ms = (double(perf_current_record_ns_) - double(phase_sum_ns)) / 1000000.0;
-            const uint64_t wait_phase_sum_ns = perf_current_detail_swapchain_render_wait_ns_ +
-                                               perf_current_detail_batch_completion_wait_ns_ +
-                                               perf_current_detail_late_publish_ns_ +
-                                               perf_current_detail_descriptor_retire_ns_ +
-                                               perf_current_detail_resource_retire_ns_;
-            sample.detail_swapchain_render_wait_ms = detail_ms(perf_current_detail_swapchain_render_wait_ns_);
-            sample.detail_batch_completion_wait_ms = detail_ms(perf_current_detail_batch_completion_wait_ns_);
-            sample.detail_late_publish_ms = detail_ms(perf_current_detail_late_publish_ns_);
-            sample.detail_descriptor_retire_ms = detail_ms(perf_current_detail_descriptor_retire_ns_);
-            sample.detail_resource_retire_ms = detail_ms(perf_current_detail_resource_retire_ns_);
+            sample.detail_record_residual_ms = (double(ActiveFrame().perf_current_record_ns) - double(phase_sum_ns)) / 1000000.0;
+            const uint64_t wait_phase_sum_ns = ActiveFrame().perf_current_detail_swapchain_render_wait_ns +
+                                               ActiveFrame().perf_current_detail_batch_completion_wait_ns +
+                                               ActiveFrame().perf_current_detail_late_publish_ns +
+                                               ActiveFrame().perf_current_detail_descriptor_retire_ns +
+                                               ActiveFrame().perf_current_detail_resource_retire_ns;
+            sample.detail_swapchain_render_wait_ms = detail_ms(ActiveFrame().perf_current_detail_swapchain_render_wait_ns);
+            sample.detail_batch_completion_wait_ms = detail_ms(ActiveFrame().perf_current_detail_batch_completion_wait_ns);
+            sample.detail_late_publish_ms = detail_ms(ActiveFrame().perf_current_detail_late_publish_ns);
+            sample.detail_descriptor_retire_ms = detail_ms(ActiveFrame().perf_current_detail_descriptor_retire_ns);
+            sample.detail_resource_retire_ms = detail_ms(ActiveFrame().perf_current_detail_resource_retire_ns);
             sample.detail_wait_phase_sum_ms = detail_ms(wait_phase_sum_ns);
             sample.detail_wait_residual_ms =
-                (double(perf_current_wait_ns_) - double(wait_phase_sum_ns)) / 1000000.0;
+                (double(ActiveFrame().perf_current_wait_ns) - double(wait_phase_sum_ns)) / 1000000.0;
         }
         perf_trace_.Frame(sample);
     }
     if (perf_window_frames_ >= perf_interval_) ReportPerfWindow();
-    perf_frame_active_ = false;
-    perf_detail_frame_active_ = false;
-    perf_frame_ended_ = false;
-    perf_query_pending_ = false;
+    ActiveFrame().perf_frame_active = false;
+    ActiveFrame().perf_detail_frame_active = false;
+    ActiveFrame().perf_frame_ended = false;
+    ActiveFrame().perf_query_pending = false;
 }
 
 bool VulkanBackend::Init(uint32_t width, uint32_t height) {
@@ -756,9 +799,14 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
     guest_height_ = height;
     render_scale_ = std::max(app::RenderScale(height), 1.0f);
     std::string error;
+    const std::filesystem::path cache_directory = app::ExeDir() / "shadercache" / "vulkan";
+    context_.SetPipelineCacheDirectory(cache_directory);
     if (!context_.Init(error, true)) return Fail("context initialization", error);
+    shader_cache_.SetDirectory(cache_directory);
     if (!LoadDrawDispatch()) return false;
-    if (!uploads_.Init(context_, 4u * 1024u * 1024u, error)) return Fail("upload allocator initialization", error);
+    for (auto& frame : frame_contexts_)
+        if (!frame.uploads.Init(context_, 4u * 1024u * 1024u, error))
+            return Fail("upload allocator initialization", error);
     if (!surface_.Init(context_, static_cast<HWND>(app::Window()), error)) return Fail("Win32 surface initialization", error);
     if (!surface_.SupportsGraphicsQueue(context_, error)) return Fail("Win32 queue support", error);
     app::Mode output = app::Output();
@@ -767,8 +815,10 @@ bool VulkanBackend::Init(uint32_t width, uint32_t height) {
                                                                        : vulkan::PresentPreference::Mailbox,
                        error) != vulkan::SwapchainInitStatus::Ready)
         return Fail("swapchain initialization", error);
-    if (!descriptors_.Init(context_, 256, error)) return Fail("descriptor ABI initialization", error);
-    if (!batch_.Init(context_, error)) return Fail("command batch initialization", error);
+    for (auto& frame : frame_contexts_)
+        if (!frame.descriptors.Init(context_, 256, error)) return Fail("descriptor ABI initialization", error);
+    for (auto& frame : frame_contexts_)
+        if (!frame.batch.Init(context_, error)) return Fail("command batch initialization", error);
     if (!InitPerfQueries()) return false;
     if (!CreatePipelineLayout()) return false;
     if (!CreateSamplers()) return false;
@@ -787,47 +837,50 @@ bool VulkanBackend::BeginFrame() {
     ReportCapabilities();
     PublishLateCompletion();
     if (terminal_) return false;
-    if (recording_) return true;
+    if (ActiveFrame().recording) return true;
+    if (frame_started_) {
+        active_frame_index_ = (active_frame_index_ + 1) % kFrameContextCount;
+        active_frame_ = &frame_contexts_[active_frame_index_];
+    } else {
+        frame_started_ = true;
+    }
     if (!perf_enabled_ && g_log_draws.load(std::memory_order_relaxed) >= 3) InitPerfQueries(3);
     const auto wait_start = std::chrono::steady_clock::now();
-    const bool capture_wait_detail = perf_frame_active_ && perf_detail_frame_active_;
+    const bool capture_wait_detail = ActiveFrame().perf_frame_active && ActiveFrame().perf_detail_frame_active;
     std::string error;
-    if (batch_.Pending()) {
-        if (swapchain_.Ready()) {
-            const auto phase_start = capture_wait_detail ? std::chrono::steady_clock::now()
-                                                         : std::chrono::steady_clock::time_point{};
-            if (!swapchain_.WaitForRendering(UINT64_MAX, error)) return Fail("presentation completion", error);
-            if (capture_wait_detail) perf_current_detail_swapchain_render_wait_ns_ += ElapsedNanoseconds(phase_start);
-        }
+    if (ActiveFrame().batch.Pending()) {
         const auto batch_wait_start = capture_wait_detail ? std::chrono::steady_clock::now()
                                                           : std::chrono::steady_clock::time_point{};
-        if (!batch_.Wait(UINT64_MAX, error)) return Fail("frame completion", error);
-        if (capture_wait_detail) perf_current_detail_batch_completion_wait_ns_ += ElapsedNanoseconds(batch_wait_start);
+        if (!ActiveFrame().batch.Wait(UINT64_MAX, error)) return Fail("frame completion", error);
+        if (capture_wait_detail) ActiveFrame().perf_current_detail_batch_completion_wait_ns += ElapsedNanoseconds(batch_wait_start);
+        completed_submission_ordinal_ = std::max(completed_submission_ordinal_, ActiveFrame().submission_ordinal);
         const auto late_publish_start = capture_wait_detail ? std::chrono::steady_clock::now()
                                                             : std::chrono::steady_clock::time_point{};
         PublishLateCompletion();
-        if (capture_wait_detail) perf_current_detail_late_publish_ns_ += ElapsedNanoseconds(late_publish_start);
-        if (descriptors_used_) {
+        if (capture_wait_detail) ActiveFrame().perf_current_detail_late_publish_ns += ElapsedNanoseconds(late_publish_start);
+        if (ActiveFrame().descriptors_used) {
             const auto descriptor_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
                                                                      : std::chrono::steady_clock::time_point{};
-            if (!descriptors_.ResetAfterCompletion(batch_, 0, error)) return Fail("descriptor retirement", error);
+            if (!ActiveFrame().descriptors.ResetAfterCompletion(ActiveFrame().batch, 0, error)) return Fail("descriptor retirement", error);
             if (capture_wait_detail)
-                perf_current_detail_descriptor_retire_ns_ += ElapsedNanoseconds(descriptor_retire_start);
+                ActiveFrame().perf_current_detail_descriptor_retire_ns += ElapsedNanoseconds(descriptor_retire_start);
         }
-        descriptors_used_ = false;
+        ActiveFrame().descriptors_used = false;
         const auto resource_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
                                                                : std::chrono::steady_clock::time_point{};
-        frame_buffers_.clear();
+        ActiveFrame().frame_buffers.clear();
         RetireUploads();
-        frame_images_.clear();
-        if (capture_wait_detail) perf_current_detail_resource_retire_ns_ += ElapsedNanoseconds(resource_retire_start);
+        ActiveFrame().frame_images.clear();
+        if (capture_wait_detail) ActiveFrame().perf_current_detail_resource_retire_ns += ElapsedNanoseconds(resource_retire_start);
     }
     const uint64_t wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - wait_start).count());
-    if (perf_frame_active_ && perf_frame_ended_) FinishPerfFrame(wait_ns);
-    if (!batch_.Begin(command_, error)) return Fail("command recording begin", error);
+    if (ActiveFrame().perf_frame_active && ActiveFrame().perf_frame_ended) FinishPerfFrame(wait_ns);
+    ActiveFrame().submission_ordinal = 0;
+    ActiveFrame().completion_fence = VK_NULL_HANDLE;
+    if (!ActiveFrame().batch.Begin(ActiveFrame().command, error)) return Fail("command recording begin", error);
     ++frame_generation_;
-    recording_ = true;
+    ActiveFrame().recording = true;
     BeginPerfFrame();
     if (!PumpOverrides()) return false;
     return true;
@@ -838,49 +891,95 @@ bool VulkanBackend::CompleteFrame() {
     if (terminal_) return false;
     EndRendering();
     EndPerfFrame();
-    const auto wait_start = std::chrono::steady_clock::now();
-    const bool capture_wait_detail = perf_frame_active_ && perf_detail_frame_active_;
     std::string error;
-    if (recording_) {
-        if (!batch_.Submit(error)) {
+    if (ActiveFrame().recording) {
+        if (!ActiveFrame().batch.Submit(error)) {
             if (!terminal_) return Fail("ordinary command submit", error);
-            batch_.Reset();
-            recording_ = false;
+            ActiveFrame().batch.Reset();
+            ActiveFrame().recording = false;
             return false;
         }
+        ActiveFrame().submission_ordinal = ++next_submission_ordinal_;
         StampLateSubmissions();
-        recording_ = false;
-        if (descriptors_used_ && !descriptors_.MarkInFlight(batch_, error)) return Fail("ordinary descriptor ownership", error);
+        ActiveFrame().recording = false;
+        if (ActiveFrame().descriptors_used && !ActiveFrame().descriptors.MarkInFlight(ActiveFrame().batch, error)) return Fail("ordinary descriptor ownership", error);
     }
-    if (batch_.Pending()) {
+    return true;
+}
+
+bool VulkanBackend::RetireFrameContext(uint32_t index, uint64_t timeout_ns, const char* operation) {
+    if (index >= kFrameContextCount) return false;
+    const uint32_t saved_index = active_frame_index_;
+    active_frame_index_ = index;
+    active_frame_ = &frame_contexts_[index];
+    if (ActiveFrame().recording) {
+        active_frame_index_ = saved_index;
+        active_frame_ = &frame_contexts_[saved_index];
+        return Fail(operation, "attempted to retire a frame context that is still recording");
+    }
+    const auto wait_start = std::chrono::steady_clock::now();
+    const bool capture_wait_detail = ActiveFrame().perf_frame_active && ActiveFrame().perf_detail_frame_active;
+    std::string error;
+    if (ActiveFrame().batch.Pending()) {
         const auto batch_wait_start = capture_wait_detail ? std::chrono::steady_clock::now()
                                                           : std::chrono::steady_clock::time_point{};
-        if (!batch_.Wait(UINT64_MAX, error)) return Fail("ordinary command completion", error);
-        if (capture_wait_detail) perf_current_detail_batch_completion_wait_ns_ += ElapsedNanoseconds(batch_wait_start);
-        const auto late_publish_start = capture_wait_detail ? std::chrono::steady_clock::now()
-                                                            : std::chrono::steady_clock::time_point{};
-        PublishLateCompletion();
-        if (capture_wait_detail) perf_current_detail_late_publish_ns_ += ElapsedNanoseconds(late_publish_start);
-        if (descriptors_used_) {
-            const auto descriptor_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
-                                                                     : std::chrono::steady_clock::time_point{};
-            if (!descriptors_.ResetAfterCompletion(batch_, 0, error))
-                return Fail("ordinary descriptor retirement", error);
-            if (capture_wait_detail)
-                perf_current_detail_descriptor_retire_ns_ += ElapsedNanoseconds(descriptor_retire_start);
+        if (!ActiveFrame().batch.Wait(timeout_ns, error)) {
+            active_frame_index_ = saved_index;
+            active_frame_ = &frame_contexts_[saved_index];
+            return Fail(operation, error);
         }
-        descriptors_used_ = false;
-        const auto resource_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
-                                                               : std::chrono::steady_clock::time_point{};
-        frame_buffers_.clear();
-        RetireUploads();
-        frame_images_.clear();
-        if (capture_wait_detail) perf_current_detail_resource_retire_ns_ += ElapsedNanoseconds(resource_retire_start);
+        if (capture_wait_detail)
+            ActiveFrame().perf_current_detail_batch_completion_wait_ns += ElapsedNanoseconds(batch_wait_start);
+        completed_submission_ordinal_ = std::max(completed_submission_ordinal_, ActiveFrame().submission_ordinal);
+        PublishLateCompletion();
     }
+    if (ActiveFrame().descriptors_used) {
+        const auto descriptor_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                                 : std::chrono::steady_clock::time_point{};
+        if (!ActiveFrame().descriptors.ResetAfterCompletion(ActiveFrame().batch, 0, error)) {
+            active_frame_index_ = saved_index;
+            active_frame_ = &frame_contexts_[saved_index];
+            return Fail(operation, error);
+        }
+        if (capture_wait_detail)
+            ActiveFrame().perf_current_detail_descriptor_retire_ns += ElapsedNanoseconds(descriptor_retire_start);
+    }
+    ActiveFrame().descriptors_used = false;
+    const auto resource_retire_start = capture_wait_detail ? std::chrono::steady_clock::now()
+                                                           : std::chrono::steady_clock::time_point{};
+    ActiveFrame().frame_buffers.clear();
+    RetireUploads();
+    ActiveFrame().frame_images.clear();
+    if (capture_wait_detail)
+        ActiveFrame().perf_current_detail_resource_retire_ns += ElapsedNanoseconds(resource_retire_start);
     const uint64_t wait_ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now() - wait_start).count());
-    if (perf_frame_active_ && perf_frame_ended_) FinishPerfFrame(wait_ns);
-    return true;
+    if (ActiveFrame().perf_frame_active && ActiveFrame().perf_frame_ended) FinishPerfFrame(wait_ns);
+    ActiveFrame().submission_ordinal = 0;
+    ActiveFrame().completion_fence = VK_NULL_HANDLE;
+    active_frame_index_ = saved_index;
+    active_frame_ = &frame_contexts_[saved_index];
+    return !terminal_;
+}
+
+bool VulkanBackend::DrainFrameContexts() {
+    EndRendering();
+    EndPerfFrame();
+    std::string error;
+    if (ActiveFrame().recording) {
+        if (!ActiveFrame().batch.Submit(error)) return Fail("drain command submit", error);
+        ActiveFrame().submission_ordinal = ++next_submission_ordinal_;
+        StampLateSubmissions();
+        ActiveFrame().recording = false;
+        if (ActiveFrame().descriptors_used && !ActiveFrame().descriptors.MarkInFlight(ActiveFrame().batch, error))
+            return Fail("drain descriptor ownership", error);
+    }
+    for (uint32_t i = 0; i < kFrameContextCount; ++i)
+        if (!RetireFrameContext(i, UINT64_MAX, "drain frame completion")) return false;
+    if (swapchain_.Ready() && !swapchain_.WaitForRendering(UINT64_MAX, error))
+        return Fail("drain presentation completion", error);
+    PublishLateCompletion();
+    return !terminal_;
 }
 
 void VulkanBackend::SetGamma(const uint8_t* ramp) {
@@ -904,7 +1003,7 @@ bool VulkanBackend::CreatePipelineLayout() {
     auto create = DeviceProc<PFN_vkCreatePipelineLayout>(context_, "vkCreatePipelineLayout");
     if (!create) return Fail("pipeline layout entry point");
     VkPipelineLayoutCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-    VkDescriptorSetLayout set = descriptors_.Layout();
+    VkDescriptorSetLayout set = ActiveFrame().descriptors.Layout();
     info.setLayoutCount = 1;
     info.pSetLayouts = &set;
     std::string error;
@@ -947,7 +1046,7 @@ bool VulkanBackend::CreateDummy() {
                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, error) ||
         !buffer->Write(0, black.data(), black.size(), error))
         return Fail("dummy upload buffer", error);
-    VkCommandBuffer command = command_;
+    VkCommandBuffer command = ActiveFrame().command;
     Transition(*dummy_, dummy_layout_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, ColorAspect());
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
@@ -956,7 +1055,7 @@ bool VulkanBackend::CreateDummy() {
     if (!copy_image) return Fail("dummy upload command entry point");
     copy_image(command, buffer->Handle(), dummy_->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     Transition(*dummy_, dummy_layout_, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ColorAspect());
-    frame_buffers_.push_back(std::move(buffer));
+    ActiveFrame().frame_buffers.push_back(std::move(buffer));
     return true;
 }
 
@@ -1001,11 +1100,11 @@ bool VulkanBackend::UploadGuestImage(vulkan::Image& image, VkImageLayout& layout
     Transition(image, layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, aspect);
     auto copy_image = DeviceProc<PFN_vkCmdCopyBufferToImage>(context_, "vkCmdCopyBufferToImage");
     if (!copy_image) return Fail("texture upload command entry point");
-    copy_image(command_, buffer->Handle(), image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    copy_image(ActiveFrame().command, buffer->Handle(), image.Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                static_cast<uint32_t>(copies.size()), copies.data());
     Transition(image, layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, aspect);
-    frame_buffers_.push_back(std::move(buffer));
-    if (perf_enabled_) ++perf_current_texture_uploads_;
+    ActiveFrame().frame_buffers.push_back(std::move(buffer));
+    if (perf_enabled_) ++ActiveFrame().perf_current_texture_uploads;
     return true;
 }
 
@@ -1045,9 +1144,9 @@ bool VulkanBackend::UploadSurface(Target& target) {
     copy.imageExtent = {target.width, target.height, 1};
     auto copy_image = DeviceProc<PFN_vkCmdCopyBufferToImage>(context_, "vkCmdCopyBufferToImage");
     if (!copy_image) return Fail("surface upload command entry point");
-    copy_image(command_, buffer->Handle(), target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    copy_image(ActiveFrame().command, buffer->Handle(), target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
     Transition(*target.image, target.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ColorAspect());
-    frame_buffers_.push_back(std::move(buffer));
+    ActiveFrame().frame_buffers.push_back(std::move(buffer));
     target.content_generation = frame_generation_;
     target.content_epoch = DirtyEpoch(desc.data);
     target.content_signature = ContentSignature(desc);
@@ -1134,7 +1233,7 @@ bool VulkanBackend::RecordTargetCopy(Target& source, Target& destination, uint32
     Transition(source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     Transition(destination, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     std::string error;
-    if (!vulkan::RecordImageTransfer(context_, command_, source.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    if (!vulkan::RecordImageTransfer(context_, ActiveFrame().command, source.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                      destination.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kColorFormat,
                                      regions, error))
         return Fail("copy command", error);
@@ -1146,9 +1245,12 @@ bool VulkanBackend::RecordTargetCopy(Target& source, Target& destination, uint32
     return true;
 }
 
-bool VulkanBackend::EnsureTarget(const Surface& surface, bool depth, Target*& out) {
+bool VulkanBackend::EnsureTarget(const Surface& source, bool depth, Target*& out) {
     out = nullptr;
-    if (!surface.data) return true;
+    if (!source.data) return true;
+    // Surface headers carry physical addresses; locks and texture descriptions use guest virtual addresses.
+    Surface surface = source;
+    surface.data = mem::VirtualFromPhysical(source.data);
     uint32_t guest_width = 0, guest_height = 0;
     SurfaceSize(surface, guest_width, guest_height);
     if (!guest_width || !guest_height) return Fail("target size", "surface has zero extent");
@@ -1190,7 +1292,7 @@ bool VulkanBackend::EnsureTarget(const Surface& surface, bool depth, Target*& ou
             if (!image->Init(context_, width, height, recreate_format, recreate_usage,
                              depth ? DepthAspect() : ColorAspect(), VK_SAMPLE_COUNT_1_BIT, recreate_error))
                 return Fail("target recreation", recreate_error);
-            if (target.image) frame_images_.push_back(std::move(target.image));
+            if (target.image) ActiveFrame().frame_images.push_back(std::move(target.image));
             target.image = std::move(image);
             target.surface = surface;
             target.guest_width = guest_width;
@@ -1308,7 +1410,7 @@ bool VulkanBackend::EnsureTexture(const State& state, int stage, Texture*& out, 
                                             texture.desc.linear != desc.linear;
             const bool palette_changed = texture.palette_va != palette.va || texture.palette_bytes != palette.bytes ||
                                          texture.palette_hash != palette.hash;
-            if (texture.image) frame_images_.push_back(std::move(texture.image));
+            if (texture.image) ActiveFrame().frame_images.push_back(std::move(texture.image));
             texture.desc = desc;
             texture.layout = VK_IMAGE_LAYOUT_UNDEFINED;
             if (descriptor_changed || palette_changed || target_cpu_changed || !texture.id) texture.id = identify();
@@ -1356,7 +1458,7 @@ bool VulkanBackend::EnsureTexture(const State& state, int stage, Texture*& out, 
         std::unique_ptr<vulkan::Image> image;
         std::string recreate_error;
         if (!make_image(image, recreate_error)) return Fail("texture recreation", recreate_error);
-        if (texture.image) frame_images_.push_back(std::move(texture.image));
+        if (texture.image) ActiveFrame().frame_images.push_back(std::move(texture.image));
         texture.image = std::move(image);
         texture.desc = desc;
         texture.id = 0;
@@ -1414,13 +1516,13 @@ bool VulkanBackend::SnapshotTargetForSampling(Target& target, VkImageView& view)
     std::vector<vulkan::ImageCopyRegion> regions(1);
     regions[0].src_extent = {target.width, target.height, 1};
     regions[0].dst_extent = {target.width, target.height, 1};
-    if (!vulkan::RecordImageTransfer(context_, command_, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    if (!vulkan::RecordImageTransfer(context_, ActiveFrame().command, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                      snapshot->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, format, regions, error,
                                      copy_aspect))
         return Fail("target feedback copy", error);
     Transition(*snapshot, snapshot_layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, layout_aspect);
     view = snapshot->SampledView();
-    frame_images_.push_back(std::move(snapshot));
+    ActiveFrame().frame_images.push_back(std::move(snapshot));
     return true;
 }
 
@@ -1447,7 +1549,7 @@ void VulkanBackend::Transition(vulkan::Image& image, VkImageLayout& current, VkI
     info.srcQueueFamilyIndex = info.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     info.image = image.Handle();
     info.subresourceRange = {aspect, 0, image.MipLevels(), 0, image.ArrayLayers()};
-    barrier(command_, src, dst, 0, 0, nullptr, 0, nullptr, 1, &info);
+    barrier(ActiveFrame().command, src, dst, 0, 0, nullptr, 0, nullptr, 1, &info);
     current = layout;
 }
 
@@ -1472,8 +1574,33 @@ void VulkanBackend::Transition(VkImage image, VkImageAspectFlags aspect, VkImage
     info.srcQueueFamilyIndex = info.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     info.image = image;
     info.subresourceRange = {aspect, 0, 1, 0, 1};
-    barrier(command_, src, dst, 0, 0, nullptr, 0, nullptr, 1, &info);
+    barrier(ActiveFrame().command, src, dst, 0, 0, nullptr, 0, nullptr, 1, &info);
     current = layout;
+}
+
+void VulkanBackend::TransitionSwapchainColorAttachment(VkImage image, VkImageLayout& current) {
+    if (current == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) return;
+    if (current != VK_IMAGE_LAYOUT_UNDEFINED && current != VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) {
+        Transition(image, ColorAspect(), current, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        return;
+    }
+    EndRendering();
+    auto barrier = draw_dispatch_.pipeline_barrier;
+    if (!barrier) {
+        Fail("swapchain color transition", "vkCmdPipelineBarrier unavailable");
+        return;
+    }
+    VkImageMemoryBarrier info{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    info.srcAccessMask = 0;
+    info.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    info.oldLayout = current;
+    info.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    info.srcQueueFamilyIndex = info.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    info.image = image;
+    info.subresourceRange = {ColorAspect(), 0, 1, 0, 1};
+    barrier(ActiveFrame().command, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0,
+            0, nullptr, 0, nullptr, 1, &info);
+    current = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 }
 
 void VulkanBackend::Transition(Target& target, VkImageLayout layout) {
@@ -1597,7 +1724,7 @@ bool VulkanBackend::BeginRendering(Target* color, Target* depth, VkImageView col
         info.pDepthAttachment = &depth_attachment;
         info.pStencilAttachment = &depth_attachment;
     }
-    begin(command_, &info);
+    begin(ActiveFrame().command, &info);
     rendering_ = true;
     rendering_color_ = color;
     rendering_depth_ = depth;
@@ -1607,7 +1734,7 @@ bool VulkanBackend::BeginRendering(Target* color, Target* depth, VkImageView col
 
 void VulkanBackend::EndRendering() {
     if (!rendering_) return;
-    if (draw_dispatch_.end_rendering) draw_dispatch_.end_rendering(command_);
+    if (draw_dispatch_.end_rendering) draw_dispatch_.end_rendering(ActiveFrame().command);
     else Fail("rendering end", "vkCmdEndRendering unavailable");
     rendering_ = false;
     rendering_color_ = rendering_depth_ = nullptr;
@@ -1642,7 +1769,7 @@ bool VulkanBackend::CompileModule(const std::string& source, const char* entry, 
                                   vulkan::ShaderModule& module, VkShaderModule& shader) {
     shader = VK_NULL_HANDLE;
     std::string error;
-    if (!vulkan::CompileShader(source, entry, stage, module, error)) return Fail("shader compilation", error);
+    if (!vulkan::CompileShader(source, entry, stage, module, &shader_cache_, error)) return Fail("shader compilation", error);
     auto create = DeviceProc<PFN_vkCreateShaderModule>(context_, "vkCreateShaderModule");
     if (!create) return Fail("shader module", "vkCreateShaderModule unavailable");
     VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -1650,7 +1777,7 @@ bool VulkanBackend::CompileModule(const std::string& source, const char* entry, 
     info.pCode = module.spirv.data();
     if (!Result(create(context_.Device(), &info, nullptr, &shader), "vkCreateShaderModule", error))
         return Fail("shader module", error);
-    if (perf_enabled_) ++perf_current_shader_modules_;
+    if (perf_enabled_) ++ActiveFrame().perf_current_shader_modules;
     return true;
 }
 
@@ -1710,7 +1837,7 @@ bool VulkanBackend::CreateBlitPipeline() {
     info.pDynamicState = &dynamic;
     info.layout = pipeline_layout_;
     std::string error;
-    VkResult result = create(context_.Device(), VK_NULL_HANDLE, 1, &info, nullptr, &blit_pipeline_);
+    VkResult result = create(context_.Device(), context_.PipelineCacheHandle(), 1, &info, nullptr, &blit_pipeline_);
     destroy_shader(context_.Device(), vsm, nullptr);
     destroy_shader(context_.Device(), psm, nullptr);
     if (!Result(result, "vkCreateGraphicsPipelines blit", error)) return Fail("blit pipeline", error);
@@ -1849,6 +1976,10 @@ bool VulkanBackend::RecreateUi() {
 bool VulkanBackend::PumpOverrides() {
     std::vector<TextureOverride> set;
     if (!TakeTextureOverrides(set)) return true;
+    // The other frame slot may still sample the previous override image. Keep those images with the
+    // slot being recorded; with two slots that lifetime covers the other in-flight submission as well.
+    for (auto& [id, texture] : override_textures_)
+        if (texture.image) ActiveFrame().frame_images.push_back(std::move(texture.image));
     override_textures_.clear();
     pending_override_uploads_.clear();
     for (const TextureOverride& override_texture : set) {
@@ -1891,10 +2022,10 @@ bool VulkanBackend::FlushOverrideUploads() {
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {pending.width, pending.height, 1};
-        copy_image(command_, pending.staging->Handle(), texture.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+        copy_image(ActiveFrame().command, pending.staging->Handle(), texture.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &copy);
         Transition(*texture.image, texture.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ColorAspect());
-        frame_buffers_.push_back(std::move(pending.staging));
+        ActiveFrame().frame_buffers.push_back(std::move(pending.staging));
     }
     pending_override_uploads_.clear();
     return true;
@@ -1946,7 +2077,7 @@ bool VulkanBackend::CreateDrawPipeline(const State& state, const Assembled& asse
         pipeline = it->second;
         return true;
     }
-    if (perf_enabled_) ++perf_current_pipeline_misses_;
+    if (perf_enabled_) ++ActiveFrame().perf_current_pipeline_misses;
     vulkan::ShaderModule vs, ps, gs;
     VkShaderModule vsm = VK_NULL_HANDLE, psm = VK_NULL_HANDLE, gsm = VK_NULL_HANDLE;
     auto destroy_shader = DeviceProc<PFN_vkDestroyShaderModule>(context_, "vkDestroyShaderModule");
@@ -1979,23 +2110,23 @@ bool VulkanBackend::CreateDrawPipeline(const State& state, const Assembled& asse
 
 void VulkanBackend::RetireUploads() {
     // Rewind only after the command batch fence has completed; earlier draws retain their bytes.
-    uploads_.Reset();
+    ActiveFrame().uploads.Reset();
     if (perf_enabled_) ++perf_window_upload_rewinds_;
 }
 
 size_t VulkanBackend::UploadBlockIndex(const vulkan::Buffer* buffer) const {
-    return uploads_.BlockIndex(buffer);
+    return ActiveFrame().uploads.BlockIndex(buffer);
 }
 
 bool VulkanBackend::AllocateUpload(VkDeviceSize size, VkDeviceSize alignment, vulkan::Buffer*& buffer,
                                   VkDeviceSize& offset) {
     std::string error;
-    const size_t blocks_before = uploads_.BlockCount();
-    if (!uploads_.Allocate(size, alignment, buffer, offset, error)) return Fail("draw upload", error);
+    const size_t blocks_before = ActiveFrame().uploads.BlockCount();
+    if (!ActiveFrame().uploads.Allocate(size, alignment, buffer, offset, error)) return Fail("draw upload", error);
     if (perf_enabled_) {
-        ++perf_current_upload_allocations_;
-        perf_current_upload_bytes_ += size;
-        if (uploads_.BlockCount() > blocks_before) ++perf_current_upload_block_grows_;
+        ++ActiveFrame().perf_current_upload_allocations;
+        ActiveFrame().perf_current_upload_bytes += size;
+        if (ActiveFrame().uploads.BlockCount() > blocks_before) ++ActiveFrame().perf_current_upload_block_grows;
     }
     return true;
 }
@@ -2033,9 +2164,9 @@ bool VulkanBackend::AllocateDescriptors(const std::array<VkImageView, vulkan::kT
     resources.textures = textures;
     resources.samplers = samplers;
     std::string error;
-    if (!descriptors_.Allocate(resources, set, error)) return Fail("descriptor allocation", error);
-    descriptors_used_ = true;
-    if (perf_enabled_) ++perf_current_descriptor_requests_;
+    if (!ActiveFrame().descriptors.Allocate(resources, set, error)) return Fail("descriptor allocation", error);
+    ActiveFrame().descriptors_used = true;
+    if (perf_enabled_) ++ActiveFrame().perf_current_descriptor_requests;
     return true;
 }
 
@@ -2049,9 +2180,9 @@ const vulkan::DrawSources& VulkanBackend::DrawSourcesFor(const State& state, con
         assembled.pretransformed, fixed, pixel_key, assembled.topology == Topology::Points, &cache_hit);
     if (perf_enabled_) {
         if (cache_hit)
-            ++perf_current_source_hits_;
+            ++ActiveFrame().perf_current_source_hits;
         else
-            ++perf_current_source_misses_;
+            ++ActiveFrame().perf_current_source_misses;
     }
     return sources;
 }
@@ -2060,7 +2191,7 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
                                Target* color, Target* depth, const std::array<VkImageView, 4>& stage_views,
                                const std::array<VkSampler, 4>& stage_samplers, const DrawConstants& constants) {
     std::chrono::steady_clock::time_point detail_start;
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     const vulkan::DrawSources& sources = DrawSourcesFor(state, assembled, pixel_key);
     VkFormat color_format = color ? kColorFormat : VK_FORMAT_UNDEFINED;
     VkFormat depth_format = depth ? kDepthFormat : VK_FORMAT_UNDEFINED;
@@ -2068,23 +2199,23 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
     PipelineKey pipeline_key;
     if (!CreateDrawPipeline(state, assembled, sources.vertex, sources.pixel, sources.geometry, color_format, depth_format,
                             pipeline, pipeline_key)) {
-        if (perf_detail_frame_active_)
-            perf_current_detail_pipeline_source_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_pipeline_source_ns += ElapsedNanoseconds(detail_start);
         return false;
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_pipeline_source_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_pipeline_source_ns += ElapsedNanoseconds(detail_start);
 
     vulkan::Buffer* constants_buffer = nullptr;
     std::array<uint32_t, vulkan::kDynamicConstantBindingCount> dynamic_offsets{};
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     if (!UploadDrawConstants(state, constants, constants_buffer, dynamic_offsets)) {
-        if (perf_detail_frame_active_)
-            perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns += ElapsedNanoseconds(detail_start);
         return false;
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns += ElapsedNanoseconds(detail_start);
     std::array<VkImageView, vulkan::kTextureBindingCount> views{};
     views.fill(dummy_->View());
     std::array<VkSampler, vulkan::kSamplerBindingCount> samplers{};
@@ -2094,18 +2225,18 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         if (stage_samplers[size_t(i)]) samplers[size_t(i)] = stage_samplers[size_t(i)];
     }
     vulkan::DescriptorSet set;
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     if (!AllocateDescriptors(views, samplers, *constants_buffer, kConstantRange, set)) {
-        if (perf_detail_frame_active_)
-            perf_current_detail_descriptor_lookup_allocation_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_descriptor_lookup_allocation_ns += ElapsedNanoseconds(detail_start);
         return false;
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_descriptor_lookup_allocation_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_descriptor_lookup_allocation_ns += ElapsedNanoseconds(detail_start);
 
     std::array<VkBuffer, 16> vertex_buffers{};
     std::array<VkDeviceSize, 16> vertex_offsets{};
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     for (uint32_t i = 0; i < assembled.buffer_count; ++i) {
         const VertexBuffer& source = assembled.buffers[i];
         vulkan::Buffer* buffer = nullptr;
@@ -2126,8 +2257,8 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         std::string error;
         if (!AllocateUpload(std::max<uint32_t>(source.bytes, 4u), 16, buffer, offset) ||
             !buffer->Write(offset, upload_source, source.bytes, error)) {
-            if (perf_detail_frame_active_)
-                perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+            if (ActiveFrame().perf_detail_frame_active)
+                ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns += ElapsedNanoseconds(detail_start);
             return Fail("vertex upload", error);
         }
         vertex_buffers[i] = buffer->Handle();
@@ -2145,8 +2276,8 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         std::string error;
         if (!AllocateUpload(bytes, 4, index_buffer, index_offset) ||
             !index_buffer->Write(index_offset, assembled.index_src, size_t(bytes), error)) {
-            if (perf_detail_frame_active_)
-                perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+            if (ActiveFrame().perf_detail_frame_active)
+                ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns += ElapsedNanoseconds(detail_start);
             return Fail("index upload", error);
         }
         if (perf_enabled_ && perf_upload_trace_count_ < 12) {
@@ -2155,13 +2286,13 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
             ++perf_upload_trace_count_;
         }
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_constant_vertex_index_upload_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_constant_vertex_index_upload_ns += ElapsedNanoseconds(detail_start);
 
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     if (!BeginRendering(color, depth)) {
-        if (perf_detail_frame_active_)
-            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_command_recording_ns += ElapsedNanoseconds(detail_start);
         return false;
     }
     auto bind_pipeline = draw_dispatch_.bind_pipeline;
@@ -2175,20 +2306,20 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
     auto set_stencil = draw_dispatch_.set_stencil_reference;
     if (!bind_pipeline || !bind_vertex || !bind_index || !draw || !draw_indexed || !set_viewport || !set_scissor ||
         !set_blend || !set_stencil) {
-        if (perf_detail_frame_active_)
-            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_command_recording_ns += ElapsedNanoseconds(detail_start);
         return Fail("draw commands", "required Vulkan draw entry point unavailable");
     }
-    bind_pipeline(command_, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    if (!descriptors_.Bind(command_, pipeline_layout_, set, dynamic_offsets, last_error_))
+    bind_pipeline(ActiveFrame().command, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    if (!ActiveFrame().descriptors.Bind(ActiveFrame().command, pipeline_layout_, set, dynamic_offsets, last_error_))
     {
-        if (perf_detail_frame_active_)
-            perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
+        if (ActiveFrame().perf_detail_frame_active)
+            ActiveFrame().perf_current_detail_command_recording_ns += ElapsedNanoseconds(detail_start);
         return Fail("descriptor bind", last_error_);
     }
     Target* viewport_target = color ? color : depth;
     VkViewport viewport{0.0f, float(viewport_target->height), float(viewport_target->width), -float(viewport_target->height), 0.0f, 1.0f};
-    set_viewport(command_, 0, 1, &viewport);
+    set_viewport(ActiveFrame().command, 0, 1, &viewport);
     float scale_x = float(viewport_target->width) / float(viewport_target->guest_width);
     float scale_y = float(viewport_target->height) / float(viewport_target->guest_height);
     int32_t x0 = int32_t(state.viewport.x * scale_x), y0 = int32_t(state.viewport.y * scale_y);
@@ -2204,17 +2335,17 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
                       std::clamp(y0, 0, int32_t(viewport_target->height))},
                      {uint32_t(std::max(0, std::min(x1, int32_t(viewport_target->width)) - std::clamp(x0, 0, int32_t(viewport_target->width)))),
                       uint32_t(std::max(0, std::min(y1, int32_t(viewport_target->height)) - std::clamp(y0, 0, int32_t(viewport_target->height))))}};
-    set_scissor(command_, 0, 1, &scissor);
+    set_scissor(ActiveFrame().command, 0, 1, &scissor);
     float blend_color[4];
     Color(SimpleState(state, kMBlendColor), blend_color);
-    set_blend(command_, blend_color);
-    set_stencil(command_, VK_STENCIL_FACE_FRONT_AND_BACK, SimpleState(state, kMStencilRef) & 0xff);
-    if (assembled.buffer_count) bind_vertex(command_, 0, assembled.buffer_count, vertex_buffers.data(), vertex_offsets.data());
+    set_blend(ActiveFrame().command, blend_color);
+    set_stencil(ActiveFrame().command, VK_STENCIL_FACE_FRONT_AND_BACK, SimpleState(state, kMStencilRef) & 0xff);
+    if (assembled.buffer_count) bind_vertex(ActiveFrame().command, 0, assembled.buffer_count, vertex_buffers.data(), vertex_offsets.data());
     if (assembled.index_count) {
-        bind_index(command_, index_buffer->Handle(), index_offset, assembled.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
-        draw_indexed(command_, assembled.index_count, 1, 0, assembled.base_vertex, 0);
+        bind_index(ActiveFrame().command, index_buffer->Handle(), index_offset, assembled.index16 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+        draw_indexed(ActiveFrame().command, assembled.index_count, 1, 0, assembled.base_vertex, 0);
     } else {
-        draw(command_, assembled.draw_count, 1, 0, 0);
+        draw(ActiveFrame().command, assembled.draw_count, 1, 0, 0);
     }
     if (color) {
         color->drawn = true;
@@ -2224,9 +2355,9 @@ bool VulkanBackend::RecordDraw(const State& state, const Assembled& assembled, c
         depth->drawn = true;
         depth->drawn_generation = frame_generation_;
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_command_recording_ns_ += ElapsedNanoseconds(detail_start);
-    if (perf_enabled_) ++perf_current_draws_;
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_command_recording_ns += ElapsedNanoseconds(detail_start);
+    if (perf_enabled_) ++ActiveFrame().perf_current_draws;
     return true;
 }
 
@@ -2299,10 +2430,10 @@ bool VulkanBackend::FlushUiUploads(const vulkan::AcquireResult& acquired) {
         VkBufferImageCopy copy{};
         copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.imageExtent = {pending.width, pending.height, 1};
-        copy_image(command_, pending.staging->Handle(), texture.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+        copy_image(ActiveFrame().command, pending.staging->Handle(), texture.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
                    &copy);
         Transition(*texture.image, texture.layout, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, ColorAspect());
-        frame_buffers_.push_back(std::move(pending.staging));
+        ActiveFrame().frame_buffers.push_back(std::move(pending.staging));
     }
     pending_ui_uploads_.clear();
     return BeginRendering(nullptr, nullptr, swapchain_.View(acquired), swapchain_.Format(), swapchain_.Extent());
@@ -2318,7 +2449,7 @@ bool VulkanBackend::RenderUi(const vulkan::AcquireResult& acquired) {
     if (app::kGame.ui) app::kGame.ui(fps_);
     ImGui::Render();
     if (!FlushUiUploads(acquired)) return false;
-    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), command_);
+    ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), ActiveFrame().command);
     return true;
 }
 
@@ -2344,11 +2475,11 @@ bool VulkanBackend::RecordSwapchainScreenshot(VkImage image, VkImageLayout& layo
     VkBufferImageCopy copy{};
     copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     copy.imageExtent = {extent.width, extent.height, 1};
-    copy_image(command_, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer->Handle(), 1, &copy);
+    copy_image(ActiveFrame().command, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer->Handle(), 1, &copy);
     VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     memory.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     memory.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    barrier(command_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &memory, 0, nullptr, 0,
+    barrier(ActiveFrame().command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &memory, 0, nullptr, 0,
             nullptr);
     Transition(image, ColorAspect(), layout, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
     screenshot_buffer_ = std::move(buffer);
@@ -2361,7 +2492,7 @@ bool VulkanBackend::FinishSwapchainScreenshot() {
     if (pending_screenshot_.empty()) return true;
     if (!screenshot_buffer_) return Fail("screenshot", "post-UI screenshot buffer is missing");
     std::string error;
-    if (!swapchain_.WaitForRendering(UINT64_MAX, error)) return Fail("screenshot completion", error);
+    if (!DrainFrameContexts()) return false;
     std::vector<uint8_t> pixels(size_t(screenshot_width_) * screenshot_height_ * 4);
     if (!screenshot_buffer_->Read(0, pixels.data(), pixels.size(), error)) return Fail("screenshot map", error);
     const VkFormat format = swapchain_.Format();
@@ -2380,7 +2511,7 @@ bool VulkanBackend::RecordBlit(Target* source, const vulkan::AcquireResult& acqu
     VkImage swap_image = swapchain_.Image(acquired);
     VkImageLayout& swap_layout = external_layouts_[swap_image];
     if (source) Transition(*source, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    Transition(swap_image, ColorAspect(), swap_layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+    TransitionSwapchainColorAttachment(swap_image, swap_layout);
     if (!BeginRendering(nullptr, nullptr, swapchain_.View(acquired), swapchain_.Format(), swapchain_.Extent())) return false;
     const VkDeviceSize alignment = std::max<VkDeviceSize>(kConstantAlignment, context_.Properties().limits.minUniformBufferOffsetAlignment);
     const VkDeviceSize draw_offset = Align(kConstantRange, alignment);
@@ -2399,7 +2530,7 @@ bool VulkanBackend::RecordBlit(Target* source, const vulkan::AcquireResult& acqu
         }
     if (!constants->Write(draw_offset, &data, sizeof(data), error)) return Fail("blit constant upload", error);
     vulkan::Buffer* constants_ptr = constants.get();
-    frame_buffers_.push_back(std::move(constants));
+    ActiveFrame().frame_buffers.push_back(std::move(constants));
     std::array<VkImageView, vulkan::kTextureBindingCount> views{};
     views.fill(dummy_->View());
     if (source) views[0] = source->image->View();
@@ -2414,13 +2545,13 @@ bool VulkanBackend::RecordBlit(Target* source, const vulkan::AcquireResult& acqu
     auto set_scissor = DeviceProc<PFN_vkCmdSetScissor>(context_, "vkCmdSetScissor");
     auto draw = DeviceProc<PFN_vkCmdDraw>(context_, "vkCmdDraw");
     if (!bind_pipeline || !set_viewport || !set_scissor || !draw) return Fail("blit commands", "entry point unavailable");
-    bind_pipeline(command_, VK_PIPELINE_BIND_POINT_GRAPHICS, blit_pipeline_);
-    if (!descriptors_.Bind(command_, pipeline_layout_, set, offsets, last_error_)) return Fail("blit descriptor bind", last_error_);
+    bind_pipeline(ActiveFrame().command, VK_PIPELINE_BIND_POINT_GRAPHICS, blit_pipeline_);
+    if (!ActiveFrame().descriptors.Bind(ActiveFrame().command, pipeline_layout_, set, offsets, last_error_)) return Fail("blit descriptor bind", last_error_);
     VkViewport viewport{0, float(swapchain_.Extent().height), float(swapchain_.Extent().width), -float(swapchain_.Extent().height), 0, 1};
     VkRect2D scissor{{0, 0}, swapchain_.Extent()};
-    set_viewport(command_, 0, 1, &viewport);
-    set_scissor(command_, 0, 1, &scissor);
-    draw(command_, 3, 1, 0, 0);
+    set_viewport(ActiveFrame().command, 0, 1, &viewport);
+    set_scissor(ActiveFrame().command, 0, 1, &scissor);
+    draw(ActiveFrame().command, 3, 1, 0, 0);
     if (!RenderUi(acquired)) return false;
     EndRendering();
     if (!pending_screenshot_.empty() && !RecordSwapchainScreenshot(swap_image, swap_layout)) return false;
@@ -2451,6 +2582,7 @@ void VulkanBackend::Clear(const State& state, uint32_t count, const uint8_t* rec
         EndRendering();
         return;
     }
+    if (depth && (flags & kClearZ) && depth == sky_scene_depth_) sky_scene_done_ = true;
     std::array<VkClearAttachment, 2> attachments{};
     uint32_t attachment_count = 0;
     if (target && (flags & kClearTarget)) {
@@ -2473,19 +2605,19 @@ void VulkanBackend::Clear(const State& state, uint32_t count, const uint8_t* rec
         Fail("clear command", "vkCmdClearAttachments unavailable");
         return;
     }
-    clear(command_, attachment_count, attachments.data(), static_cast<uint32_t>(clear_rects.size()), clear_rects.data());
+    clear(ActiveFrame().command, attachment_count, attachments.data(), static_cast<uint32_t>(clear_rects.size()), clear_rects.data());
 }
 
 void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
     if (!BeginFrame()) return;
     Assembled assembled;
     std::chrono::steady_clock::time_point detail_start;
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     if (!Assemble(state, prim, start, count, indices, assembled)) return;
-    if (perf_detail_frame_active_)
-        perf_current_detail_vertex_assembly_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_vertex_assembly_ns += ElapsedNanoseconds(detail_start);
 
-    if (perf_detail_frame_active_) detail_start = std::chrono::steady_clock::now();
+    if (ActiveFrame().perf_detail_frame_active) detail_start = std::chrono::steady_clock::now();
     Target* color = nullptr;
     Target* depth = nullptr;
     if (!EnsureTarget(state.rt, false, color)) return;
@@ -2550,16 +2682,59 @@ void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint
         samplers[size_t(stage)] = SamplerFor(state, stage, infos[size_t(stage)].shadow != 0, sampled_format);
         if (!samplers[size_t(stage)]) return;
     }
-    if (perf_detail_frame_active_)
-        perf_current_detail_texture_target_sampler_ns_ += ElapsedNanoseconds(detail_start);
+    if (ActiveFrame().perf_detail_frame_active)
+        ActiveFrame().perf_current_detail_texture_target_sampler_ns += ElapsedNanoseconds(detail_start);
     PixelKey pixel_key = MakePixelKey(state, infos.data());
     pixel_key.quad = count <= 6 && !state.rs[kRsZEnable];
+    const bool flat = state.layout2d || assembled.pretransformed;
+    if (flat && sky_scene_color_) sky_scene_done_ = true;
     if (g_hide_hud.load(std::memory_order_relaxed) && (state.layout2d & 0xff) == 1) return;
     DrawConstants constants{};
     const bool programmable = (state.vs_handle & 1) && state.vs && !state.vs->program.empty();
+    if (g_log_draws.load(std::memory_order_relaxed) > 0) {
+        const bool fog_enable = state.rs[kRsFogEnable] != 0;
+        const bool range_enable = state.rs[kRsRangeFogEnable] != 0;
+        const uint32_t fog_mode = state.rs[kRsFogTableMode];
+        // Xbox fog uses the four low mode values; keep the per-frame mask within 64 bits.
+        const uint32_t variant = (fog_enable ? 1u : 0u) | ((fog_mode & 3u) << 1) |
+                                 (range_enable ? (1u << 3) : 0u) |
+                                 (programmable ? (1u << 4) : 0u) | (flat ? (1u << 5) : 0u);
+        const uint64_t bit = uint64_t{1} << variant;
+        if ((fog_trace_seen_ & bit) == 0) {
+            fog_trace_seen_ |= bit;
+            LOGR("vulkan: fog trace enable %u range %u mode %u prog %u flat %u start %.6g end %.6g density %.6g color %08X",
+                 fog_enable ? 1u : 0u, range_enable ? 1u : 0u, fog_mode, programmable ? 1u : 0u,
+                 flat ? 1u : 0u, Bits(state.rs[kRsFogStart]), Bits(state.rs[kRsFogEnd]),
+                 Bits(state.rs[kRsFogDensity]), state.rs[kRsFogColor]);
+        }
+    }
     FixedKey fixed = programmable ? FixedKey{} : MakeFixedKey(state);
     FillConstants(state, color ? color->guest_width : depth->guest_width, color ? color->guest_height : depth->guest_height,
                   programmable, assembled.pretransformed, fixed, infos, constants);
+    if (!flat && !sky_scene_done_ && color && depth && color->guest_width == guest_width_ &&
+        color->guest_height == guest_height_) {
+        sky_scene_color_ = color;
+        sky_scene_depth_ = depth;
+    }
+    const bool shell_scene_eligible =
+        !flat && !sky_scene_done_ && color && color == sky_scene_color_ && sky_scene_depth_ &&
+        color->guest_width == guest_width_ && color->guest_height == guest_height_;
+    if (shell_scene_eligible) {
+        constexpr uint32_t kAlways = 0x207;
+        const bool shell_sky = sky_phase_ && state.rs[kRsZEnable] && SimpleState(state, kMZWriteEnable) &&
+                               SimpleState(state, kMZFunc) == kAlways;
+        if (g_level.load(std::memory_order_relaxed) == 1) {
+            if (shell_sky && sky_layer_ < 16) {
+                constants.jitter[3] = 1.0f - float(sky_layer_++) * kSkyLayerStep;
+            } else {
+                sky_phase_ = false;
+            }
+        } else if (shell_sky) {
+            constants.jitter[3] = 1.0f;
+        } else {
+            sky_phase_ = false;
+        }
+    }
     recolor_ = false;
     if (state.layout2d || assembled.pretransformed) {
         Draw2D draw;
@@ -2596,6 +2771,28 @@ void VulkanBackend::Draw(const State& state, uint32_t prim, uint32_t start, uint
 
 void VulkanBackend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                          uint32_t dst_points) {
+    TextureDesc source_desc;
+    if (DescribeSurface(src, source_desc) && Format(source_desc.format).depth) {
+        if (!BeginFrame()) return;
+        EndRendering();
+        if (!CopySurfaceMemory(src, dst, count, src_rects, dst_points)) {
+            Fail("copy", "depth-source CPU surface copy does not support the requested formats");
+            return;
+        }
+        TextureDesc destination_desc;
+        if (!DescribeSurface(dst, destination_desc) || Format(destination_desc.format).depth) return;
+        auto destination_it = targets_.find(SurfaceKey(dst, false));
+        if (destination_it == targets_.end()) return;
+        Target& destination = destination_it->second;
+        if (destination.depth || !destination.image || destination.guest_width != destination_desc.width ||
+            destination.guest_height != destination_desc.height)
+            return;
+        destination.surface = dst;
+        destination.drawn = false;
+        destination.readback.clear();
+        if (!UploadSurface(destination)) return;
+        return;
+    }
     if (!BeginFrame()) return;
     EndRendering();
     Target* source = nullptr;
@@ -2646,13 +2843,13 @@ bool VulkanBackend::ReadBackPixels(Target& target, std::vector<uint8_t>& pixels)
     auto copy_image = DeviceProc<PFN_vkCmdCopyImageToBuffer>(context_, "vkCmdCopyImageToBuffer");
     auto barrier = DeviceProc<PFN_vkCmdPipelineBarrier>(context_, "vkCmdPipelineBarrier");
     if (!copy_image || !barrier) return Fail("readback command", "required Vulkan readback entry point unavailable");
-    copy_image(command_, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->Handle(), 1, &copy);
+    copy_image(ActiveFrame().command, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback->Handle(), 1, &copy);
     VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     memory.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     memory.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
-    barrier(command_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
+    barrier(ActiveFrame().command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &memory, 0, nullptr, 0, nullptr);
     Transition(target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (!CompleteFrame()) return false;
+    if (!CompleteFrame() || !DrainFrameContexts()) return false;
     pixels.resize(static_cast<size_t>(bytes));
     if (!readback->Read(0, pixels.data(), pixels.size(), error)) return Fail("readback map", error);
     return true;
@@ -2675,6 +2872,8 @@ bool VulkanBackend::ReadBack(Target& target, uint32_t data_va) {
         !WriteBackSurface(surface_desc, pixels.data(), target.width, target.height, target.width * 4, pixels.size(), guest,
                           guest_bytes, &target.readback))
         return Fail("readback write", "guest surface writeback rejected by the shared format, pitch or bounds contract");
+    if (perf_counters_enabled_.load(std::memory_order_relaxed))
+        perf_window_guest_writeback_successes_.fetch_add(1, std::memory_order_relaxed);
     target.content_epoch = DirtyEpoch(surface_desc.data);
     target.content_signature = ContentSignature(surface_desc);
     target.content_generation = frame_generation_;
@@ -2683,6 +2882,8 @@ bool VulkanBackend::ReadBack(Target& target, uint32_t data_va) {
 }
 
 void VulkanBackend::Sync(uint32_t data_va, uint32_t size) {
+    if (perf_counters_enabled_.load(std::memory_order_relaxed))
+        perf_window_sync_requests_.fetch_add(1, std::memory_order_relaxed);
     const uint64_t request_begin = data_va;
     const uint64_t request_end = request_begin + (size ? size : 1);
     for (auto& [key, target] : targets_)
@@ -2701,7 +2902,7 @@ void VulkanBackend::Sync(uint32_t data_va, uint32_t size) {
 }
 
 void VulkanBackend::StampLateSubmissions() {
-    const uint64_t serial = batch_.SubmissionSerial();
+    const uint64_t serial = ActiveFrame().submission_ordinal;
     late_published_generation_.store(frame_generation_, std::memory_order_release);
     if (!serial) return;
     std::lock_guard lock(late_lock_);
@@ -2717,15 +2918,22 @@ void VulkanBackend::PublishLateCompletion() {
         Fail("late readback", "a previous late-copy operation failed");
         return;
     }
-    const VkResult status = batch_.CompletionStatus();
-    if (status == VK_SUCCESS) {
-        late_published_completed_serial_.store(batch_.SubmissionSerial(), std::memory_order_release);
-        return;
+    uint64_t completed = completed_submission_ordinal_;
+    for (const auto& frame : frame_contexts_) {
+        if (!frame.batch.Pending()) continue;
+        const VkResult status = frame.batch.CompletionStatus();
+        if (status == VK_SUCCESS) {
+            completed = std::max(completed, frame.submission_ordinal);
+            continue;
+        }
+        if (status != VK_NOT_READY) {
+            late_published_error_.store(static_cast<int>(status), std::memory_order_release);
+            Fail("late completion", "Vulkan fence status reported an unexpected error");
+            return;
+        }
     }
-    if (status != VK_NOT_READY) {
-        late_published_error_.store(static_cast<int>(status), std::memory_order_release);
-        Fail("late completion", "Vulkan fence status reported an unexpected error");
-    }
+    completed_submission_ordinal_ = completed;
+    late_published_completed_serial_.store(completed, std::memory_order_release);
 }
 
 void VulkanBackend::SyncLate(uint32_t data_va) {
@@ -2734,57 +2942,84 @@ void VulkanBackend::SyncLate(uint32_t data_va) {
 }
 
 bool VulkanBackend::DeliverLate(uint32_t data_va) {
-    if (late_published_error_.load(std::memory_order_acquire) != VK_SUCCESS) return false;
+    const auto miss = [this]() {
+        if (perf_counters_enabled_.load(std::memory_order_relaxed))
+            perf_window_deliver_late_misses_.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    const auto hit = [this]() {
+        if (perf_counters_enabled_.load(std::memory_order_relaxed))
+            perf_window_deliver_late_hits_.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    };
+    if (late_published_error_.load(std::memory_order_acquire) != VK_SUCCESS) return miss();
     std::lock_guard lock(late_lock_);
     auto it = late_.find(data_va);
-    if (it == late_.end() || !it->second.configured) return false;
+    if (it == late_.end() || !it->second.configured) return miss();
     Late& late = it->second;
     const uint64_t completed = late_published_completed_serial_.load(std::memory_order_acquire);
     const uint64_t published = late_published_generation_.load(std::memory_order_acquire);
     const int best = vulkan::LateDeliverySlot(late.states, completed, published, late.identity_generation,
                                                Late::kSlotCount + 1);
-    if (best < 0) return false;
+    if (best < 0) return miss();
     LateSlot& slot = late.slots[best];
     const auto& state = late.states[best];
     if (!slot.readback || slot.desc.data != data_va || !SameLateDesc(slot.desc, late.desc) ||
         slot.width != late.width || slot.height != late.height || slot.image_identity != late.image_identity)
-        return false;
-    if (!vulkan::LateNeedsWrite(state, late.delivered_serial)) return true;
+        return miss();
+    if (!vulkan::LateNeedsWrite(state, late.delivered_serial)) return hit();
     const size_t guest_bytes = size_t(slot.desc.pitch) * slot.desc.height;
-    if (!slot.desc.width || !slot.desc.height || guest_bytes / slot.desc.height != slot.desc.pitch) return false;
+    if (!slot.desc.width || !slot.desc.height || guest_bytes / slot.desc.height != slot.desc.pitch) return miss();
     std::vector<uint8_t> pixels(size_t(slot.width) * slot.height * 4);
     std::string error;
     if (!slot.readback->Read(0, pixels.data(), pixels.size(), error)) {
         late_published_error_.store(VK_ERROR_UNKNOWN, std::memory_order_release);
-        return false;
+        return miss();
     }
     uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data_va));
     if (!WriteBackSurface(slot.desc, pixels.data(), slot.width, slot.height, slot.width * 4, pixels.size(), guest,
                           guest_bytes, nullptr))
-        return false;
+        return miss();
+    if (perf_counters_enabled_.load(std::memory_order_relaxed))
+        perf_window_guest_writeback_successes_.fetch_add(1, std::memory_order_relaxed);
     late.delivered_serial = state.submission_serial;
     late.states[best].delivered_serial = state.submission_serial;
     late.acknowledged_epoch = DirtyEpoch(slot.desc.data);
     late.acknowledged_signature = ContentSignature(slot.desc);
     late.acknowledged_identity = late.identity_generation;
     late.acknowledgement_pending = true;
-    return true;
+    return hit();
 }
 
 void VulkanBackend::RecordLate(uint32_t data_va) {
+    const auto skip = [this]() {
+        if (perf_counters_enabled_.load(std::memory_order_relaxed))
+            perf_window_record_late_skips_.fetch_add(1, std::memory_order_relaxed);
+    };
     auto target_it = targets_.find(SurfaceKey(Surface{.data = data_va}, false));
-    if (target_it == targets_.end() || target_it->second.depth || !target_it->second.image) return;
+    if (target_it == targets_.end() || target_it->second.depth || !target_it->second.image) {
+        skip();
+        return;
+    }
     Target& target = target_it->second;
     TextureDesc desc;
     if (!DescribeSurface(target.surface, desc) || desc.data != data_va || !CanWriteBackSurface(desc) || !desc.width ||
-        !desc.height || desc.pitch < uint64_t(desc.width) * 4)
+        !desc.height || desc.pitch < uint64_t(desc.width) * 4) {
+        skip();
         return;
-    if (!BeginFrame()) return;
+    }
+    if (!BeginFrame()) {
+        skip();
+        return;
+    }
     const VkDeviceSize bytes = VkDeviceSize(target.width) * target.height * 4;
-    if (!bytes || bytes / target.height / 4 != target.width) return;
+    if (!bytes || bytes / target.height / 4 != target.width) {
+        skip();
+        return;
+    }
     std::lock_guard lock(late_lock_);
     Late& late = late_[data_va];
-    const uint64_t completed = batch_.CompletedSerial();
+    const uint64_t completed = completed_submission_ordinal_;
     const bool shape_changed = late.configured &&
                                (!SameLateDesc(late.desc, desc) || late.width != target.width || late.height != target.height ||
                                 late.image_identity != target.image->Handle());
@@ -2800,7 +3035,10 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
     if (late.retire_pending) {
         bool all_retired = true;
         all_retired = vulkan::LateSlotsRetired(late.states, completed);
-        if (!all_retired) return;
+        if (!all_retired) {
+            skip();
+            return;
+        }
         late.slots = {};
         late.states = {};
         late.next = 0;
@@ -2816,14 +3054,17 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
         late.configured = true;
     }
     const int slot_index = vulkan::LateRecordSlot(late.states, late.next, completed);
-    if (slot_index < 0) return;
+    if (slot_index < 0) {
+        skip();
+        return;
+    }
     LateSlot& slot = late.slots[slot_index];
     if (!slot.readback || slot.readback->Size() != bytes) {
         if (!slot.readback) slot.readback = std::make_unique<vulkan::Buffer>();
         std::string error;
         if (!slot.readback->Init(context_, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
                                  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, error))
-            return (void)Fail("late readback buffer", error);
+            return (void)(skip(), Fail("late readback buffer", error));
     }
     EndRendering();
     Transition(target, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
@@ -2834,9 +3075,9 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
     auto barrier2 = DeviceProc<PFN_vkCmdPipelineBarrier2>(context_, "vkCmdPipelineBarrier2");
     if (!copy_image || !barrier2) {
         Transition(target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        return (void)Fail("late readback command", "required Vulkan copy/barrier entry point unavailable");
+        return (void)(skip(), Fail("late readback command", "required Vulkan copy/barrier entry point unavailable"));
     }
-    copy_image(command_, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.readback->Handle(), 1, &copy);
+    copy_image(ActiveFrame().command, target.image->Handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slot.readback->Handle(), 1, &copy);
     VkBufferMemoryBarrier2 host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
     host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
     host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -2849,7 +3090,7 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
     VkDependencyInfo dependency{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
     dependency.bufferMemoryBarrierCount = 1;
     dependency.pBufferMemoryBarriers = &host;
-    barrier2(command_, &dependency);
+    barrier2(ActiveFrame().command, &dependency);
     Transition(target, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     slot.desc = desc;
     slot.width = target.width;
@@ -2857,6 +3098,8 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
     slot.image_identity = target.image->Handle();
     late.states[slot_index] = {frame_generation_, late.identity_generation, 0, 0, true};
     late.next = (late.next + 1) % Late::kSlotCount;
+    if (perf_counters_enabled_.load(std::memory_order_relaxed))
+        perf_window_record_late_accepted_.fetch_add(1, std::memory_order_relaxed);
     target.content_epoch = DirtyEpoch(desc.data);
     target.content_signature = ContentSignature(desc);
     target.content_generation = frame_generation_;
@@ -2864,6 +3107,11 @@ void VulkanBackend::RecordLate(uint32_t data_va) {
 }
 
 void VulkanBackend::Present(const Surface& front) {
+    fog_trace_seen_ = 0;
+    sky_phase_ = true;
+    sky_layer_ = 0;
+    sky_scene_done_ = false;
+    sky_scene_color_ = sky_scene_depth_ = nullptr;
     perf_trace_.Present(g_frame_stats.load() == 1);
     if (!BeginFrame()) return;
     Target* source = nullptr;
@@ -2877,13 +3125,19 @@ void VulkanBackend::Present(const Surface& front) {
     std::string error;
     vulkan::AcquireResult acquired = swapchain_.Acquire(UINT64_MAX, error);
     if (!acquired.Succeeded()) {
-        if (acquired.status == vulkan::AcquireStatus::RecreateRequired) {
+        const bool recreate_requested = acquired.status == vulkan::AcquireStatus::RecreateRequired ||
+                                        (acquired.status == vulkan::AcquireStatus::Suspended && !swapchain_.Ready());
+        if (recreate_requested) {
+            if (!DrainFrameContexts()) return;
             const VkFormat old_format = swapchain_.Format();
             const uint32_t old_image_count = swapchain_.ImageCount();
             app::Mode output = app::Output();
-            if (swapchain_.Recreate({std::max(output.width, 1u), std::max(output.height, 1u)},
-                                    app::Get().vsync ? vulkan::PresentPreference::Fifo : vulkan::PresentPreference::Mailbox,
-                                    error) == vulkan::SwapchainInitStatus::Ready) {
+            const vulkan::SwapchainInitStatus recreate_status =
+                swapchain_.Recreate({std::max(output.width, 1u), std::max(output.height, 1u)},
+                                     app::Get().vsync ? vulkan::PresentPreference::Fifo
+                                                      : vulkan::PresentPreference::Mailbox,
+                                     error);
+            if (recreate_status == vulkan::SwapchainInitStatus::Ready) {
                 external_layouts_.clear();
                 if (old_format != swapchain_.Format()) {
                     if (!RecreateUi()) {
@@ -2894,13 +3148,41 @@ void VulkanBackend::Present(const Surface& front) {
                     std::lock_guard lock(app::UiLock());
                     ImGui_ImplVulkan_SetMinImageCount(std::max(2u, swapchain_.ImageCount()));
                 }
+                if (!BeginFrame()) return;
                 acquired = swapchain_.Acquire(UINT64_MAX, error);
+            } else if (recreate_status == vulkan::SwapchainInitStatus::Suspended) {
+                CompleteFrame();
+                return;
+            } else {
+                if (error.empty()) {
+                    switch (recreate_status) {
+                        case vulkan::SwapchainInitStatus::CapabilityLimited:
+                            error = "Vulkan swapchain recreate returned CapabilityLimited";
+                            break;
+                        case vulkan::SwapchainInitStatus::SurfaceLost:
+                            error = "Vulkan swapchain recreate returned SurfaceLost";
+                            break;
+                        case vulkan::SwapchainInitStatus::DeviceLost:
+                            error = "Vulkan swapchain recreate returned DeviceLost";
+                            break;
+                        case vulkan::SwapchainInitStatus::Failed:
+                            error = "Vulkan swapchain recreate returned Failed";
+                            break;
+                        case vulkan::SwapchainInitStatus::Ready:
+                        case vulkan::SwapchainInitStatus::Suspended:
+                            break;
+                    }
+                }
+                CompleteFrame();
+                Fail("swapchain recreate", error);
+                return;
             }
         }
         if (!acquired.Succeeded()) {
             CompleteFrame();
             if (acquired.status == vulkan::AcquireStatus::Suspended || acquired.status == vulkan::AcquireStatus::NotReady ||
-                acquired.status == vulkan::AcquireStatus::Timeout)
+                acquired.status == vulkan::AcquireStatus::Timeout ||
+                acquired.status == vulkan::AcquireStatus::RecreateRequired)
                 return;
             Fail("swapchain acquire", error);
             return;
@@ -2913,34 +3195,50 @@ void VulkanBackend::Present(const Surface& front) {
         return;
     }
     EndPerfFrame();
-    if (!batch_.EndForExternalSubmit(error)) {
+    if (!ActiveFrame().batch.EndForExternalSubmit(error)) {
         EndRendering();
         std::string abandon;
         swapchain_.Abandon(acquired, abandon);
         Fail("external command end", error);
         return;
     }
-    if (!swapchain_.Submit(acquired, command_, error)) {
+    const VkFence prior_image_fence = swapchain_.RenderFenceForImage(acquired.image_index);
+    for (uint32_t i = 0; i < kFrameContextCount; ++i) {
+        if (!prior_image_fence || i == active_frame_index_ || frame_contexts_[i].completion_fence != prior_image_fence ||
+            !frame_contexts_[i].batch.Pending())
+            continue;
+        if (!RetireFrameContext(i, UINT64_MAX, "swapchain render-fence owner retirement")) {
+            EndRendering();
+            std::string abandon;
+            swapchain_.Abandon(acquired, abandon);
+            return;
+        }
+    }
+    if (!swapchain_.Submit(acquired, ActiveFrame().command, error, vulkan::SubmitWaitPolicy::ColorAttachmentOutput)) {
         EndRendering();
         std::string abandon;
         swapchain_.Abandon(acquired, abandon);
         Fail("swapchain submit", error);
         return;
     }
-    if (!batch_.MarkExternalSubmitted(swapchain_.RenderFence(acquired), error)) {
+    const VkFence completion_fence = swapchain_.RenderFence(acquired);
+    if (!ActiveFrame().batch.MarkExternalSubmitted(completion_fence, error)) {
         std::string completion_error;
         swapchain_.WaitForRendering(UINT64_MAX, completion_error);
-        batch_.Wait(UINT64_MAX, completion_error);
+        ActiveFrame().batch.Wait(UINT64_MAX, completion_error);
         std::string abandon;
         swapchain_.Abandon(acquired, abandon);
         Fail("external completion adoption", error);
         return;
     }
+    ActiveFrame().recording = false;
+    ActiveFrame().submission_ordinal = ++next_submission_ordinal_;
+    ActiveFrame().completion_fence = completion_fence;
     StampLateSubmissions();
-    if (descriptors_used_ && !descriptors_.MarkInFlight(batch_, error)) {
+    if (ActiveFrame().descriptors_used && !ActiveFrame().descriptors.MarkInFlight(ActiveFrame().batch, error)) {
         std::string completion_error;
         swapchain_.WaitForRendering(UINT64_MAX, completion_error);
-        batch_.Wait(UINT64_MAX, completion_error);
+        ActiveFrame().batch.Wait(UINT64_MAX, completion_error);
         swapchain_.Abandon(acquired, completion_error);
         Fail("present descriptor ownership", error);
         return;
@@ -2961,11 +3259,18 @@ void VulkanBackend::Present(const Surface& front) {
         fps_sample_frame_ = frame_count_;
         fps_sample_time_ = now;
     }
-    recording_ = false;
 }
 
 void VulkanBackend::Flush() {
-    CompleteFrame();
+    if (CompleteFrame()) DrainFrameContexts();
+}
+
+void VulkanBackend::PrepareShutdown() {
+    if (!context_.Initialized()) return;
+    Flush();
+    if (perf_enabled_) ReportPerfWindow();
+    if (!context_.PersistPipelineCache())
+        LOGW("vulkan: persistent pipeline cache was not written during shutdown");
 }
 
 std::unique_ptr<Backend> CreateVulkanBackend() { return std::make_unique<VulkanBackend>(); }

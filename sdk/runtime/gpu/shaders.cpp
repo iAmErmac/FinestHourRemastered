@@ -309,7 +309,7 @@ const char* kVsEpilogue = R"(
     o.tc1 = oT1;
     o.tc2 = oT2;
     o.tc3 = oT3;
-    o.fogamt = fogfactor(oFog.x);
+    o.fogamt = fogp.w == 0 ? saturate(oFog.x) : fogfactor(oFog.x);
     // a point's size: the program's own (oPts), else the render state's
     o.psize = oPts.x >= 0 ? oPts.x : pts0.x;
     return o;
@@ -1627,7 +1627,12 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
         s += "    }\n";
     }
     s += "    oFog = " + v(5, "float4(0,0,0,0)") + ";\n";
-    if (pretransformed) return s + kVsEpilogue;
+    if (pretransformed) {
+        s += "    if (fogcolor.a > 1.5) oFog = float4(" + v(4, "float4(0,0,0,0)") + ".w, 0, 0, 0);\n";
+        s += "    else if (fogcolor.a > 0.5) oFog = float4(rhw.z, 0, 0, 0);\n";
+        s += "    else oFog = w.xxxx;\n";
+        return s + kVsEpilogue;
+    }
     s += R"(
     VOut o = (VOut)0;
     // like the pretransformed ones, target sized passes end half a console pixel short of the far edges
@@ -1658,7 +1663,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     o.tc1 = oT1;
     o.tc2 = oT2;
     o.tc3 = oT3;
-    o.fogamt = fogfactor(abs(cp.z));
+    // Mode NONE uses the fixed-function specular alpha; other table modes use the generated distance.
+    o.fogamt = fogp.w == 0 ? o.d1.w : fogfactor(fogcolor.a > 0.5 ? length(vp) : vp.z);
     o.pn = float4(vn, 0);
     o.pv = float4(vp, 1);
     return o;

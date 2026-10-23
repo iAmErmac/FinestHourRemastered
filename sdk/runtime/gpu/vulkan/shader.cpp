@@ -1,5 +1,8 @@
 #include "gpu/vulkan/shader.h"
 
+#include "gpu/shaders.h"
+#include "gpu/vulkan/shader_cache.h"
+
 #ifndef ENABLE_HLSL
 #define ENABLE_HLSL 1
 #endif
@@ -9,11 +12,16 @@
 #include <glslang/Public/ShaderLang.h>
 
 #include <algorithm>
+#include <array>
 #include <mutex>
 #include <regex>
 #include <utility>
 #include <unordered_set>
 #include <unordered_map>
+
+#ifndef CODF_GLSLANG_COMMIT
+#define CODF_GLSLANG_COMMIT "unknown"
+#endif
 
 namespace gpu::vulkan {
 namespace {
@@ -377,6 +385,65 @@ std::string AdaptHlsl(const std::string& source) {
     return std::regex_replace(adapted, attr, "$1[[vk::location($3)]] $2");
 }
 
+constexpr uint32_t kShaderCacheSourceSchema = 1;
+constexpr int kShaderSourceVersion = 100;
+constexpr glslang::EShClient kShaderClient = glslang::EShClientVulkan;
+constexpr glslang::EShTargetClientVersion kShaderClientVersion = glslang::EShTargetVulkan_1_3;
+constexpr glslang::EShTargetLanguage kShaderTargetLanguage = glslang::EShTargetSpv;
+constexpr glslang::EShTargetLanguageVersion kShaderTargetVersion = glslang::EShTargetSpv_1_6;
+constexpr EShMessages kShaderMessages =
+    EShMessages(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl | EShMsgHlslOffsets);
+constexpr bool kShaderHlslIoMapping = true;
+constexpr bool kShaderAutoMapBindings = false;
+constexpr bool kShaderAutoMapLocations = true;
+constexpr bool kShaderDisableOptimizer = true;
+constexpr bool kShaderValidate = false;
+
+uint64_t BindingIdentity() {
+    constexpr std::array<uint32_t, 7> binding = {
+        kShaderAbiVersion, kConstantBindingBase, kConstantBindingCount, kTextureBindingBase,
+        kTextureBindingCount, kSamplerBindingBase, kSamplerBindingCount,
+    };
+    return gpu::Hash(binding.data(), binding.size() * sizeof(binding[0]));
+}
+
+uint64_t CompilerOptionsIdentity() {
+    constexpr std::array<uint64_t, 11> settings = {
+        static_cast<uint64_t>(kShaderSourceVersion), static_cast<uint64_t>(kShaderClient),
+        static_cast<uint64_t>(kShaderClientVersion), static_cast<uint64_t>(kShaderTargetLanguage),
+        static_cast<uint64_t>(kShaderTargetVersion), static_cast<uint64_t>(kShaderMessages),
+        kShaderHlslIoMapping, kShaderAutoMapBindings, kShaderAutoMapLocations, kShaderDisableOptimizer,
+        kShaderValidate,
+    };
+    return gpu::Hash(settings.data(), settings.size() * sizeof(settings[0]));
+}
+
+uint64_t CompilerIdentity() {
+    const glslang::Version version = glslang::GetVersion();
+    std::string identity = std::string(CODF_GLSLANG_COMMIT) + "|" + std::to_string(version.major) + "." +
+                           std::to_string(version.minor) + "." + std::to_string(version.patch) + "|" +
+                           (version.flavor ? version.flavor : "") + "|spvgen=" +
+                           std::to_string(glslang::GetSpirvGeneratorVersion());
+    std::string spirv_version;
+    glslang::GetSpirvVersion(spirv_version);
+    identity += "|" + spirv_version;
+    return gpu::Hash(identity.data(), identity.size());
+}
+
+ShaderCacheKey MakeCacheKey(const std::string& source, const char* entry, ShaderStage stage,
+                            uint64_t compiler_identity, uint64_t options_identity) {
+    ShaderCacheKey key;
+    key.stage = static_cast<uint32_t>(stage);
+    key.shader_abi = kShaderAbiVersion;
+    key.source_schema = kShaderCacheSourceSchema;
+    key.compiler_identity = compiler_identity;
+    key.options_identity = options_identity;
+    key.binding_identity = BindingIdentity();
+    key.source = source;
+    key.entry = entry ? entry : "";
+    return key;
+}
+
 }  // namespace
 
 bool ReflectShader(const std::vector<uint32_t>& spirv, ShaderReflection& reflection, std::string& error) {
@@ -390,6 +457,11 @@ bool ReflectShader(const std::vector<uint32_t>& spirv, ShaderReflection& reflect
 
 bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage, ShaderModule& module,
                    std::string& error) {
+    return CompileShader(hlsl, entry, stage, module, nullptr, error);
+}
+
+bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage, ShaderModule& module,
+                   ShaderCache* cache, std::string& error) {
     module = {};
     error.clear();
     if (!entry || !*entry) {
@@ -405,35 +477,51 @@ bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage
     }
     const EShLanguage language = Language(stage);
     const std::string source = AdaptHlsl(hlsl);
+    const ShaderCacheKey cache_key =
+        MakeCacheKey(source, entry, stage, CompilerIdentity(), CompilerOptionsIdentity());
+    if (cache && cache->Enabled()) {
+        ShaderModule cached;
+        if (cache->Load(cache_key, cached.spirv)) {
+            std::string cache_error;
+            if (ReflectShader(cached.spirv, cached.reflection, cache_error) && cached.reflection.stage == stage &&
+                cached.reflection.entry == entry) {
+                module = std::move(cached);
+                cache->RecordHit();
+                return true;
+            }
+            cache->RecordRejected();
+        }
+        cache->RecordMiss();
+        cache->RecordCompilerInvocation();
+    }
     const char* text = source.c_str();
     const int length = static_cast<int>(source.size());
     glslang::TShader shader(language);
     shader.setStringsWithLengths(&text, &length, 1);
     shader.setEntryPoint(entry);
     shader.setSourceEntryPoint(entry);
-    shader.setEnvInput(glslang::EShSourceHlsl, language, glslang::EShClientVulkan, 100);
-    shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_3);
-    shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_6);
-    shader.setHlslIoMapping(true);
-    shader.setAutoMapBindings(false);
-    shader.setAutoMapLocations(true);
+    shader.setEnvInput(glslang::EShSourceHlsl, language, kShaderClient, kShaderSourceVersion);
+    shader.setEnvClient(kShaderClient, kShaderClientVersion);
+    shader.setEnvTarget(kShaderTargetLanguage, kShaderTargetVersion);
+    shader.setHlslIoMapping(kShaderHlslIoMapping);
+    shader.setAutoMapBindings(kShaderAutoMapBindings);
+    shader.setAutoMapLocations(kShaderAutoMapLocations);
     shader.setShiftBinding(glslang::EResUbo, kConstantBindingBase);
     shader.setShiftBinding(glslang::EResTexture, kTextureBindingBase);
     shader.setShiftBinding(glslang::EResSampler, kSamplerBindingBase);
-    const auto messages = EShMessages(EShMsgSpvRules | EShMsgVulkanRules | EShMsgReadHlsl | EShMsgHlslOffsets);
-    if (!shader.parse(GetDefaultResources(), 100, false, messages)) {
+    if (!shader.parse(GetDefaultResources(), kShaderSourceVersion, false, kShaderMessages)) {
         error = std::string("glslang ") + StageName(stage) + " parse failed: " + shader.getInfoLog();
         return false;
     }
     glslang::TProgram program;
     program.addShader(&shader);
-    if (!program.link(messages) || !program.mapIO()) {
+    if (!program.link(kShaderMessages) || !program.mapIO()) {
         error = std::string("glslang ") + StageName(stage) + " link failed: " + program.getInfoLog();
         return false;
     }
     glslang::SpvOptions options;
-    options.disableOptimizer = true;
-    options.validate = false;
+    options.disableOptimizer = kShaderDisableOptimizer;
+    options.validate = kShaderValidate;
     ShaderModule candidate;
     glslang::GlslangToSpv(*program.getIntermediate(language), candidate.spirv, &options);
     if (candidate.spirv.empty()) {
@@ -445,6 +533,7 @@ bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage
         error = std::string("SPIR-V reflection disagrees with requested ") + StageName(stage) + " entry point";
         return false;
     }
+    if (cache && cache->Enabled()) cache->Store(cache_key, candidate.spirv);
     module = std::move(candidate);
     return true;
 }

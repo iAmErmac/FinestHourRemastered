@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
@@ -550,6 +551,40 @@ void EncodeWritebackPixel(uint32_t format, const uint8_t* bgra, uint8_t* guest) 
     }
 }
 
+struct WritebackSampleAxis {
+    uint32_t low = 0;
+    uint32_t high = 0;
+    float weight = 0.0f;
+};
+
+WritebackSampleAxis WritebackSampleAxisAt(uint32_t output, uint32_t output_extent, uint32_t source_extent) {
+    const double coordinate = (double(output) + 0.5) * double(source_extent) / double(output_extent) - 0.5;
+    if (coordinate <= 0.0) return {};
+    const double last = double(source_extent - 1);
+    if (coordinate >= last) return {source_extent - 1, source_extent - 1, 0.0f};
+    const uint32_t low = static_cast<uint32_t>(std::floor(coordinate));
+    return {low, low + 1, static_cast<float>(coordinate - double(low))};
+}
+
+uint8_t RoundWritebackUnorm(float value) {
+    return static_cast<uint8_t>(std::floor(std::clamp(value, 0.0f, 255.0f) + 0.5f));
+}
+
+void SampleWritebackLinear(const uint8_t* source, uint32_t source_pitch, const WritebackSampleAxis& x,
+                           const WritebackSampleAxis& y, uint8_t* bgra) {
+    const uint8_t* top_left = source + size_t(y.low) * source_pitch + size_t(x.low) * 4;
+    const uint8_t* top_right = source + size_t(y.low) * source_pitch + size_t(x.high) * 4;
+    const uint8_t* bottom_left = source + size_t(y.high) * source_pitch + size_t(x.low) * 4;
+    const uint8_t* bottom_right = source + size_t(y.high) * source_pitch + size_t(x.high) * 4;
+    const float top_weight = 1.0f - y.weight;
+    const float bottom_weight = y.weight;
+    for (uint32_t channel = 0; channel < 4; ++channel) {
+        const float top = float(top_left[channel]) * (1.0f - x.weight) + float(top_right[channel]) * x.weight;
+        const float bottom = float(bottom_left[channel]) * (1.0f - x.weight) + float(bottom_right[channel]) * x.weight;
+        bgra[channel] = RoundWritebackUnorm(top * top_weight + bottom * bottom_weight);
+    }
+}
+
 }  // namespace
 
 bool WriteBackSurface(const TextureDesc& d, const uint8_t* source, uint32_t source_width, uint32_t source_height,
@@ -566,13 +601,21 @@ bool WriteBackSurface(const TextureDesc& d, const uint8_t* source, uint32_t sour
         guest_bytes < required_guest)
         return false;
     if (canonical) canonical->assign(required_canonical, 0);
+    const bool scaled = source_width != d.width || source_height != d.height;
     for (uint32_t y = 0; y < d.height; ++y) {
-        const uint32_t source_y = std::min(source_height - 1, uint32_t(uint64_t(y) * source_height / d.height));
+        const WritebackSampleAxis sample_y = scaled ? WritebackSampleAxisAt(y, d.height, source_height)
+                                                     : WritebackSampleAxis{};
         for (uint32_t x = 0; x < d.width; ++x) {
-            const uint32_t source_x = std::min(source_width - 1, uint32_t(uint64_t(x) * source_width / d.width));
-            const uint8_t* bgra = source + size_t(source_y) * source_pitch + source_x * 4;
+            uint8_t sampled[4];
+            if (scaled) {
+                SampleWritebackLinear(source, source_pitch, WritebackSampleAxisAt(x, d.width, source_width), sample_y,
+                                      sampled);
+            } else {
+                const uint8_t* bgra = source + size_t(y) * source_pitch + size_t(x) * 4;
+                std::memcpy(sampled, bgra, sizeof(sampled));
+            }
             uint8_t* encoded = guest + size_t(y) * d.pitch + x * 4;
-            EncodeWritebackPixel(d.format, bgra, encoded);
+            EncodeWritebackPixel(d.format, sampled, encoded);
             if (canonical) DecodePixel(d.format, encoded, canonical->data() + (size_t(y) * d.width + x) * 4);
         }
     }

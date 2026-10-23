@@ -201,7 +201,7 @@ VkPipeline CreatePipelineState(const Context& context, VkPipelineLayout layout, 
     info.pDynamicState = &dynamic;
     info.layout = layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
-    return create(context.Device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
+    return create(context.Device(), context.PipelineCacheHandle(), 1, &info, nullptr, &pipeline) == VK_SUCCESS ? pipeline : VK_NULL_HANDLE;
 }
 
 }  // namespace gpu::vulkan

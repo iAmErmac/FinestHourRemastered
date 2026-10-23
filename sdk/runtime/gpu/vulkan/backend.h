@@ -15,6 +15,7 @@
 #include "gpu/vulkan/late_readback.h"
 #include "gpu/vulkan/pipeline_state.h"
 #include "gpu/vulkan/shader.h"
+#include "gpu/vulkan/shader_cache.h"
 #include "gpu/vulkan/sampler.h"
 #include "gpu/vulkan/shader_sources.h"
 #include "gpu/vulkan/swapchain.h"
@@ -56,6 +57,7 @@ public:
     bool DeliverLate(uint32_t data_va) override;
     void RecordLate(uint32_t data_va) override;
     void Flush() override;
+    void PrepareShutdown() override;
     void SetGamma(const uint8_t* ramp) override;
     uint64_t UiImage(const std::string& key, const remaster::Image* image, bool source_missing) override;
     bool TvScreen(float[4]) override { return false; }
@@ -147,8 +149,59 @@ private:
         }
     };
 
+    struct FrameContext {
+        vulkan::CommandBatch batch;
+        vulkan::DescriptorArena descriptors;
+        VkCommandBuffer command = VK_NULL_HANDLE;
+        std::vector<std::unique_ptr<vulkan::Buffer>> frame_buffers;
+        vulkan::UploadAllocator uploads;
+        // Images replaced while recording must remain alive until this batch retires.
+        std::vector<std::unique_ptr<vulkan::Image>> frame_images;
+        bool recording = false;
+        bool descriptors_used = false;
+        uint64_t submission_ordinal = 0;
+        VkFence completion_fence = VK_NULL_HANDLE;
+
+        VkQueryPool perf_query_pool = VK_NULL_HANDLE;
+        bool perf_detail_frame_active = false;
+        bool perf_frame_active = false;
+        bool perf_frame_ended = false;
+        bool perf_query_pending = false;
+        uint64_t perf_current_draws = 0;
+        uint64_t perf_current_pipeline_misses = 0;
+        uint64_t perf_current_shader_modules = 0;
+        uint64_t perf_current_source_hits = 0;
+        uint64_t perf_current_source_misses = 0;
+        uint64_t perf_current_texture_uploads = 0;
+        uint64_t perf_current_descriptor_requests = 0;
+        uint64_t perf_current_record_ns = 0;
+        uint64_t perf_current_wait_ns = 0;
+        uint64_t perf_current_detail_vertex_assembly_ns = 0;
+        uint64_t perf_current_detail_texture_target_sampler_ns = 0;
+        uint64_t perf_current_detail_pipeline_source_ns = 0;
+        uint64_t perf_current_detail_constant_vertex_index_upload_ns = 0;
+        uint64_t perf_current_detail_descriptor_lookup_allocation_ns = 0;
+        uint64_t perf_current_detail_command_recording_ns = 0;
+        uint64_t perf_current_detail_swapchain_render_wait_ns = 0;
+        uint64_t perf_current_detail_batch_completion_wait_ns = 0;
+        uint64_t perf_current_detail_late_publish_ns = 0;
+        uint64_t perf_current_detail_descriptor_retire_ns = 0;
+        uint64_t perf_current_detail_resource_retire_ns = 0;
+        uint64_t perf_current_upload_allocations = 0;
+        uint64_t perf_current_upload_bytes = 0;
+        uint64_t perf_current_upload_block_grows = 0;
+        bool perf_current_gpu_valid = false;
+        double perf_current_gpu_ms = 0.0;
+        std::chrono::steady_clock::time_point perf_frame_start;
+        double perf_current_frame_ms = 0.0;
+    };
+
     bool BeginFrame();
     bool CompleteFrame();
+    bool RetireFrameContext(uint32_t index, uint64_t timeout_ns, const char* operation);
+    bool DrainFrameContexts();
+    FrameContext& ActiveFrame() { return *active_frame_; }
+    const FrameContext& ActiveFrame() const { return *active_frame_; }
     bool Fail(const char* operation, const std::string& detail = {});
     bool EnsureTarget(const Surface& surface, bool depth, Target*& out);
     bool EnsureTexture(const State& state, int stage, Texture*& out, TextureDesc& desc);
@@ -204,6 +257,7 @@ private:
     void Transition(Target& target, VkImageLayout layout);
     void Transition(vulkan::Image& image, VkImageLayout& current, VkImageLayout layout, VkImageAspectFlags aspect);
     void Transition(VkImage image, VkImageAspectFlags aspect, VkImageLayout& current, VkImageLayout layout);
+    void TransitionSwapchainColorAttachment(VkImage image, VkImageLayout& current);
     bool RecordDraw(const State& state, const Assembled& assembled, const PixelKey& pixel_key, Target* color, Target* depth,
                     const std::array<VkImageView, 4>& stage_views, const std::array<VkSampler, 4>& stage_samplers,
                     const DrawConstants& constants);
@@ -220,9 +274,13 @@ private:
     vulkan::Context context_;
     vulkan::Win32Surface surface_;
     vulkan::Swapchain swapchain_;
-    vulkan::CommandBatch batch_;
-    vulkan::DescriptorArena descriptors_;
-    VkCommandBuffer command_ = VK_NULL_HANDLE;
+    static constexpr uint32_t kFrameContextCount = 2;
+    std::array<FrameContext, kFrameContextCount> frame_contexts_;
+    FrameContext* active_frame_ = &frame_contexts_[0];
+    uint32_t active_frame_index_ = 0;
+    bool frame_started_ = false;
+    uint64_t next_submission_ordinal_ = 0;
+    uint64_t completed_submission_ordinal_ = 0;
     VkPipelineLayout pipeline_layout_ = VK_NULL_HANDLE;
     VkPipeline blit_pipeline_ = VK_NULL_HANDLE;
     VkSampler linear_sampler_ = VK_NULL_HANDLE;
@@ -232,6 +290,7 @@ private:
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint64_t, Texture> textures_;
     std::unordered_map<PipelineKey, VkPipeline, PipelineHash> pipelines_;
+    vulkan::ShaderCache shader_cache_;
     vulkan::DrawSourceCache shader_sources_;
     struct OverrideTex {
         std::unique_ptr<vulkan::Image> image;
@@ -244,10 +303,6 @@ private:
     };
     std::unordered_map<uint64_t, OverrideTex> override_textures_;
     std::vector<PendingOverrideUpload> pending_override_uploads_;
-    std::vector<std::unique_ptr<vulkan::Buffer>> frame_buffers_;
-    vulkan::UploadAllocator uploads_;
-    // Images replaced while recording must remain alive until that batch retires.
-    std::vector<std::unique_ptr<vulkan::Image>> frame_images_;
     std::vector<VkSampler> samplers_;
     std::unordered_map<SamplerKey, VkSampler, SamplerHash> stage_samplers_;
     uint32_t custom_border_sampler_count_ = 0;
@@ -284,18 +339,22 @@ private:
     std::string last_error_;
     uint32_t guest_width_ = 0, guest_height_ = 0;
     float render_scale_ = 1.0f;
-    bool recording_ = false;
     bool rendering_ = false;
     std::atomic<bool> terminal_{false};
     bool capability_reported_ = false;
     uint64_t capability_settings_signature_ = 0;
-    bool descriptors_used_ = false;
     Target* rendering_color_ = nullptr;
     Target* rendering_depth_ = nullptr;
     bool recolor_ = false;
     uint32_t recolor_argb_ = 0;
     VertexElement recolor_element_{};
     uint64_t frame_count_ = 0;
+    // Bit mask for the distinct fog-state variants seen while draw tracing is armed.
+    uint64_t fog_trace_seen_ = 0;
+    bool sky_phase_ = true, sky_scene_done_ = false;
+    Target* sky_scene_color_ = nullptr;
+    Target* sky_scene_depth_ = nullptr;
+    uint32_t sky_layer_ = 0;
     uint64_t frame_generation_ = 0;
     bool gamma_dirty_ = true;
     bool gamma_effective_ = false;
@@ -332,38 +391,8 @@ private:
     bool perf_enabled_ = false;
     // Detail timing is opt-in and only records while the existing perf trace control is armed.
     bool perf_detail_enabled_ = false;
-    bool perf_detail_frame_active_ = false;
     uint32_t perf_interval_ = 0;
-    VkQueryPool perf_query_pool_ = VK_NULL_HANDLE;
-    bool perf_frame_active_ = false;
-    bool perf_frame_ended_ = false;
-    bool perf_query_pending_ = false;
-    uint64_t perf_current_draws_ = 0;
-    uint64_t perf_current_pipeline_misses_ = 0;
-    uint64_t perf_current_shader_modules_ = 0;
-    uint64_t perf_current_source_hits_ = 0;
-    uint64_t perf_current_source_misses_ = 0;
-    uint64_t perf_current_texture_uploads_ = 0;
-    uint64_t perf_current_descriptor_requests_ = 0;
-    uint64_t perf_current_record_ns_ = 0;
-    uint64_t perf_current_wait_ns_ = 0;
-    uint64_t perf_current_detail_vertex_assembly_ns_ = 0;
-    uint64_t perf_current_detail_texture_target_sampler_ns_ = 0;
-    uint64_t perf_current_detail_pipeline_source_ns_ = 0;
-    uint64_t perf_current_detail_constant_vertex_index_upload_ns_ = 0;
-    uint64_t perf_current_detail_descriptor_lookup_allocation_ns_ = 0;
-    uint64_t perf_current_detail_command_recording_ns_ = 0;
-    uint64_t perf_current_detail_swapchain_render_wait_ns_ = 0;
-    uint64_t perf_current_detail_batch_completion_wait_ns_ = 0;
-    uint64_t perf_current_detail_late_publish_ns_ = 0;
-    uint64_t perf_current_detail_descriptor_retire_ns_ = 0;
-    uint64_t perf_current_detail_resource_retire_ns_ = 0;
-    uint64_t perf_current_upload_allocations_ = 0;
-    uint64_t perf_current_upload_bytes_ = 0;
-    uint64_t perf_current_upload_block_grows_ = 0;
     uint32_t perf_upload_trace_count_ = 0;
-    bool perf_current_gpu_valid_ = false;
-    double perf_current_gpu_ms_ = 0.0;
     uint64_t perf_window_frames_ = 0;
     uint64_t perf_window_draws_ = 0;
     uint64_t perf_window_pipeline_misses_ = 0;
@@ -381,9 +410,16 @@ private:
     size_t perf_window_peak_upload_blocks_ = 0;
     uint64_t perf_window_gpu_samples_ = 0;
     double perf_window_gpu_ms_ = 0.0;
-    std::chrono::steady_clock::time_point perf_frame_start_;
+    // Late-readback coverage is kept in the existing opt-in perf window. DeliverLate can
+    // run on the title thread while the render thread reports and resets the window.
+    std::atomic<bool> perf_counters_enabled_{false};
+    std::atomic<uint64_t> perf_window_sync_requests_{0};
+    std::atomic<uint64_t> perf_window_deliver_late_hits_{0};
+    std::atomic<uint64_t> perf_window_deliver_late_misses_{0};
+    std::atomic<uint64_t> perf_window_record_late_accepted_{0};
+    std::atomic<uint64_t> perf_window_record_late_skips_{0};
+    std::atomic<uint64_t> perf_window_guest_writeback_successes_{0};
     diag::PerfTrace perf_trace_{"vulkan"};
-    double perf_current_frame_ms_ = 0.0;
     uint64_t perf_trace_frame_index_ = 0;
 };
 

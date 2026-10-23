@@ -256,6 +256,12 @@ void VerticalBlank(X86Context& ctx) {
 gpu::State& State() { return g_state; }
 std::recursive_mutex& Lock() { return g_lock; }
 
+void PrepareBackendForExit() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (!g_backend) return;
+    g_backend->PrepareShutdown();
+}
+
 }  // namespace d3d
 
 using namespace d3d;

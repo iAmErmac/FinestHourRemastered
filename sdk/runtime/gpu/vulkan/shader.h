@@ -6,6 +6,8 @@
 
 namespace gpu::vulkan {
 
+class ShaderCache;
+
 inline constexpr uint32_t kVertexRegisterCount = 192;
 inline constexpr uint32_t kVertexRegisterBytes = kVertexRegisterCount * 16u;
 
@@ -67,6 +69,8 @@ struct ShaderModule {
 
 bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage, ShaderModule& module,
                    std::string& error);
+bool CompileShader(const std::string& hlsl, const char* entry, ShaderStage stage, ShaderModule& module,
+                   ShaderCache* cache, std::string& error);
 
 // Parses the generated module and verifies the reflection data used by the host ABI.
 bool ReflectShader(const std::vector<uint32_t>& spirv, ShaderReflection& reflection, std::string& error);

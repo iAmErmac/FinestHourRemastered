@@ -66,6 +66,7 @@ public:
     virtual bool DeliverLate(uint32_t) { return false; }
     virtual void RecordLate(uint32_t) {}
     virtual void Flush() = 0;
+    virtual void PrepareShutdown() { Flush(); }
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
 
     // the XDK's fences and busy checks against the render thread; a backend that draws at once is never behind

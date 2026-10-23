@@ -103,6 +103,93 @@ bool Down(int key) {
 
 bool g_menu = false;  // the poll is for a menu: the mouse works the menu, not its bindings
 
+// Some remote/virtual HID devices report normalized absolute coordinates. Keep their screen-position baseline separate
+// from relative counts, and recenter only while the game's real window owns capture so the view does not hit an edge.
+struct AbsoluteMouseState {
+    std::mutex lock;
+    bool valid = false, virtual_desktop = false, warp_pending = false;
+    HANDLE device = nullptr;
+    RECT bounds{};
+    POINT previous{}, warp{};
+};
+
+AbsoluteMouseState g_absolute;
+
+void ResetAbsoluteMouse() {
+    std::lock_guard lock(g_absolute.lock);
+    g_absolute.valid = false;
+    g_absolute.warp_pending = false;
+    g_absolute.device = nullptr;
+}
+
+bool AbsoluteCapture() {
+    return g_in_game.load(std::memory_order_relaxed) && g_hwnd && GetForegroundWindow() == g_hwnd &&
+           cod::Get().keyboard_mouse && !cod::OverlayOpen() && !cod::Paused() && !cod::InMovie() && g_rebind < 0;
+}
+
+bool OwnedClientCenter(POINT& center) {
+    if (!AbsoluteCapture()) return false;
+    RECT client{};
+    if (!GetClientRect(g_hwnd, &client)) return false;
+    SetLastError(ERROR_SUCCESS);
+    const int mapped = MapWindowPoints(g_hwnd, nullptr, reinterpret_cast<POINT*>(&client), 2);
+    if (mapped == 0 && GetLastError() != ERROR_SUCCESS) return false;
+    if (client.right <= client.left || client.bottom <= client.top) return false;
+    {
+        std::lock_guard lock(g_clip_lock);
+        RECT current{};
+        if (!g_clip_owned || !EqualRect(&g_owned_clip, &client) || !GetClipCursor(&current) || !EqualRect(&current, &client))
+            return false;
+    }
+    center = {(client.left + client.right) / 2, (client.top + client.bottom) / 2};
+    return AbsoluteCapture();
+}
+
+bool AbsoluteLook(const RAWMOUSE& mouse, HANDLE device, int& dx, int& dy) {
+    const bool virtual_desktop = (mouse.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0;
+    const int left = virtual_desktop ? GetSystemMetrics(SM_XVIRTUALSCREEN) : 0;
+    const int top = virtual_desktop ? GetSystemMetrics(SM_YVIRTUALSCREEN) : 0;
+    const int width = virtual_desktop ? GetSystemMetrics(SM_CXVIRTUALSCREEN) : GetSystemMetrics(SM_CXSCREEN);
+    const int height = virtual_desktop ? GetSystemMetrics(SM_CYVIRTUALSCREEN) : GetSystemMetrics(SM_CYSCREEN);
+    if (width < 2 || height < 2) {
+        ResetAbsoluteMouse();
+        return false;
+    }
+    const auto normalized = [](LONG value) { return std::clamp<long long>(value, 0, 65535); };
+    const int x = left + int((normalized(mouse.lLastX) * (width - 1) + 32767) / 65535);
+    const int y = top + int((normalized(mouse.lLastY) * (height - 1) + 32767) / 65535);
+    const RECT bounds{left, top, left + width, top + height};
+    std::lock_guard lock(g_absolute.lock);
+    if (!g_absolute.valid || g_absolute.device != device || g_absolute.virtual_desktop != virtual_desktop ||
+        !EqualRect(&g_absolute.bounds, &bounds)) {
+        g_absolute.valid = true;
+        g_absolute.device = device;
+        g_absolute.virtual_desktop = virtual_desktop;
+        g_absolute.bounds = bounds;
+        g_absolute.previous = {x, y};
+        g_absolute.warp_pending = false;
+        return false;
+    }
+    if (g_absolute.warp_pending && std::abs(g_absolute.warp.x - x) <= 1 && std::abs(g_absolute.warp.y - y) <= 1) {
+        g_absolute.previous = {x, y};
+        g_absolute.warp_pending = false;
+        return false;
+    }
+    g_absolute.warp_pending = false;
+    dx = x - g_absolute.previous.x;
+    dy = y - g_absolute.previous.y;
+    g_absolute.previous = {x, y};
+    if (dx == 0 && dy == 0) return false;
+
+    POINT center{};
+    if (OwnedClientCenter(center) && SetCursorPos(center.x, center.y)) {
+        g_absolute.previous = center;
+        g_absolute.warp_pending = true;
+        g_absolute.warp = center;
+    }
+    return true;
+}
+
 bool MouseKey(int key) {
     return key == VK_LBUTTON || key == VK_RBUTTON || key == VK_MBUTTON || key == VK_XBUTTON1 || key == VK_XBUTTON2 ||
            key == kWheelUp || key == kWheelDown;
@@ -284,7 +371,8 @@ void Window(void* hwnd) {
         ReleaseClipLocked();
     }
     g_hwnd = static_cast<HWND>(hwnd);
-    RAWINPUTDEVICE rid{0x01, 0x02, 0, g_hwnd};  // generic desktop, mouse
+    ResetAbsoluteMouse();
+    RAWINPUTDEVICE rid{0x01, 0x02, RIDEV_DEVNOTIFY, g_hwnd};  // generic desktop, mouse
     if (!RegisterRawInputDevices(&rid, 1, sizeof(rid))) LOGW("input: raw mouse input not registered (%lu)", GetLastError());
 }
 
@@ -292,14 +380,24 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
     (void)hwnd;
     switch (msg) {
         case WM_INPUT: {
-            RAWINPUT ri;
+            RAWINPUT ri{};
             UINT size = sizeof(ri);
-            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) != UINT(-1) &&
-                ri.header.dwType == RIM_TYPEMOUSE && !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) && Active()) {
-                g_dx += ri.data.mouse.lLastX;
-                g_dy += ri.data.mouse.lLastY;
-                if (std::abs(ri.data.mouse.lLastX) + std::abs(ri.data.mouse.lLastY) > 2) cod::prompts::KeyboardUsed();
+            if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lp), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER)) == UINT(-1) ||
+                ri.header.dwType != RIM_TYPEMOUSE)
+                return false;
+            int dx = ri.data.mouse.lLastX, dy = ri.data.mouse.lLastY;
+            if (ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) {
+                if (!AbsoluteCapture()) {
+                    ResetAbsoluteMouse();
+                    return false;
+                }
+                if (!AbsoluteLook(ri.data.mouse, ri.header.hDevice, dx, dy)) return false;
+            } else if (!Active()) {
+                return false;
             }
+            g_dx += dx;
+            g_dy += dy;
+            if (std::abs(dx) + std::abs(dy) > 2) cod::prompts::KeyboardUsed();
             return false;
         }
         case WM_MOUSEWHEEL: {
@@ -346,6 +444,9 @@ bool Message(void* hwnd, uint32_t msg, uintptr_t wp, intptr_t lp, intptr_t* resu
         case WM_ACTIVATE:
         case WM_SIZE:
         case WM_MOVE:
+        case WM_DISPLAYCHANGE:
+        case WM_INPUT_DEVICE_CHANGE:
+            ResetAbsoluteMouse();
             Clip();
             break;
     }
@@ -358,7 +459,10 @@ bool Active() {
 }
 
 void SetCapture(bool in_game) {
-    if (g_in_game.exchange(in_game) != in_game) Clip();
+    if (g_in_game.exchange(in_game) != in_game) {
+        ResetAbsoluteMouse();
+        Clip();
+    }
 }
 
 int Rebinding() { return g_rebind; }
